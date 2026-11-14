@@ -1,0 +1,14 @@
+{
+  "name": "ebay-seller-mcp",
+  "version": "1.0.0",
+  "description": "eBay seller MCP server: Terapeak product research (sold prices, sell-through, trends, categories, active competition) and eBay search results as buyers see them — read through the seller's own logged-in Ziniao (紫鸟) store browser, no eBay API keys needed.",
+  "type": "module",
+  "bin": { "ebay-seller-mcp": "bin/ebay-seller-mcp.mjs" },
+  "files": ["bin/", "lib/", "README.md"],
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "keywords": ["mcp", "ebay", "terapeak", "seller", "ziniao", "紫鸟", "market-research"],
+  "repository": { "type": "git", "url": "git+https://github.com/mrsxs/ebay-seller-mcp.git" },
+  "homepage": "https://github.com/mrsxs/ebay-seller-mcp#readme",
+  "license": "MIT"
+}
