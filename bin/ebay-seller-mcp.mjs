@@ -19,6 +19,7 @@ import {
 } from '../lib/listing.mjs';
 import { applyChange, buildReviseXml, END_REASONS, planEnd, planRelist, planRevise, reviseSnapshot, reviseSteps } from '../lib/changes.mjs';
 import { parseItemDetail, parseSellingList, sellingRequest } from '../lib/manage.mjs';
+import { ORDER_STATUS, orderErrorMessage, ordersPath, parseOrder, parseStandards, parseTraffic, summarizeOrders, TRAFFIC_DAYS, trafficPath, trafficRange } from '../lib/store.mjs';
 import { AuthError, createTokenProvider, defaultKeysFile, LISTING_SCOPES } from '../lib/oauth.mjs';
 import { CONDITIONS, parseResults, readSearchPage, searchUrl, SORTS } from '../lib/search.mjs';
 import { ShopConfigError, parseShops, resolveShop } from '../lib/shops.mjs';
@@ -404,6 +405,73 @@ const listingPublish = async (a) => {
     ...(r.xml ? { fees: parseFees(r.xml), warnings: r.warnings } : {}), note };
 };
 
+// ---- 自家店铺数据（eBay 开放平台，只读）：订单、流量、卖家表现 ----
+const orders = async (a) => {
+  const shop = shopFor(a.shop);
+  const pageSize = a.page_size ?? 50;
+  const page = a.page ?? 1;
+  return withUserToken(shop, async (token) => {
+    let j;
+    try {
+      j = await restCall({ token, path: ordersPath({ days: a.days ?? 30, status: a.status ?? 'all', limit: pageSize, offset: (page - 1) * pageSize }) });
+    } catch (err) {
+      // 订单接口的报错原文可能带订单 / 买家信息：只给状态码和错误码
+      if (err instanceof ApiError && !(err instanceof TokenRejectedError) && orderErrorMessage(err)) throw new ApiError(orderErrorMessage(err));
+      throw err;
+    }
+    const list = (j.orders ?? []).map(parseOrder);
+    return {
+      shop: shop.name, days: a.days ?? 30, status: a.status ?? 'all', page, total: j.total ?? list.length, orders: list, summary: summarizeOrders(list),
+      note: '自家店铺订单（eBay 美国站，按下单时间从新到旧，时间是 UTC）。fulfillment_status：NOT_STARTED 未发货 / IN_PROGRESS 部分发货 / FULFILLED 已发货；'
+        + 'status=unshipped 是还没发完的（含部分发货），shipped 是发了货的（也含部分发货）。'
+        + 'total 订单总额（含运费），due_seller 是 eBay 记录的卖家应收（可能包含 eBay 代收代缴的销售税，实际到手以回款为准）；ship_by 最晚发货时间；sold_via_ad 是否通过推广售出。summary 只统计这一页（已取消的不算销售额和热销商品）。'
+        + '买家姓名、用户名、地址、电话、邮箱一律不返回，只给收货国家。',
+    };
+  });
+};
+
+const listingTitles = (shop, token) => cachedResult('api', `${shop.storeId}|titles`, async () => {
+  const out = {};
+  for (let page = 1; page <= 5; page++) {
+    const r = failIf(await tradingCall({ token, call: 'GetMyeBaySelling', body: sellingRequest({ status: 'active', page, pageSize: 200 }) }), '读在售 listing ');
+    const l = parseSellingList(r.xml, 'active');
+    for (const it of l.items) out[it.item_id] = it.title;
+    if (page >= l.pages) break;
+  }
+  return { titles: out };
+});
+
+const traffic = async (a) => {
+  const shop = shopFor(a.shop);
+  const range = trafficRange(a.days ?? 30);
+  const by = a.by ?? 'day';
+  const itemIds = a.item_id ? [a.item_id] : [];
+  return cachedResult('api', `${shop.storeId}|traffic|${by}|${range.start}|${range.end}|${a.item_id ?? ''}|${a.limit ?? 30}`, () => withUserToken(shop, async (token) => {
+    const out = parseTraffic(await restCall({ token, path: trafficPath({ range, by, itemIds }) }), by, range);
+    if (by === 'listing') {
+      const { titles } = await listingTitles(shop, token);
+      out.rows = out.rows.slice(0, a.limit ?? 30).map((r) => ({ item_id: r.item_id, title: titles[r.item_id] ?? null, ...r }));
+    }
+    return { shop: shop.name, by, ...range, item_id: a.item_id ?? null, ...out,
+      note: '自家店铺流量（eBay 美国站，Seller Hub 流量报告同源；日期按美国太平洋时间，到昨天为止）。impressions_total 总曝光（含站内外各种展示）；listing_impressions 商品曝光，'
+        + '其中 search_impressions 搜索结果页曝光、store_impressions 店铺页曝光；views 商品页浏览，views_from_search 来自搜索的浏览；transactions 成交笔数。'
+        + 'search_ctr = 来自搜索的浏览 ÷ 搜索曝光；conversion = 成交笔数 ÷ 浏览（比例，0~1）；值为 null 表示 eBay 没给（incomplete 里列出缺的项）。'
+        + 'totals 只覆盖有数据的 totals_days 天；missing_days 是要的日期里 eBay 还没给的天（通常是最近一两天还没更新）。'
+        + '按商品时按商品曝光从高到低，eBay 最多返回 200 条，不给全店合计（全店合计用 by=day）。' };
+  }));
+};
+
+const sellerStandards = async (a) => {
+  const shop = shopFor(a.shop);
+  return cachedResult('api', `${shop.storeId}|standards`, () => withUserToken(shop, async (token) => ({
+    shop: shop.name,
+    programs: parseStandards(await restCall({ token, path: '/sell/analytics/v1/seller_standards_profile' })),
+    note: '卖家表现（eBay 卖家等级评估）：level 是 TOP_RATED 优秀 / ABOVE_STANDARD 合格 / BELOW_STANDARD 不合格；metrics 是各项考核指标（交易缺陷率、延迟发货率、未解决纠纷等）的当前值、等级和门槛'
+      + '（threshold_lower 下限 / threshold_upper 上限，type、threshold_meta 说明怎么比）。'
+      + 'program 里 PROGRAM_US 是美国站，PROGRAM_GLOBAL 是全球。',
+  })));
+};
+
 // ---- 修改已有 listing：预检（算出改前 → 改后，存成修改记录）→ 用户确认 → ebay_listing_apply ----
 const fetchItem = async (token, itemId) => parseItemDetail(failIf(await tradingCall({ token, call: 'GetItem', body: `<ItemID>${itemId}</ItemID><DetailLevel>ReturnAll</DetailLevel><IncludeItemSpecifics>true</IncludeItemSpecifics>` }), '读 listing ').xml);
 
@@ -489,6 +557,7 @@ const INSTRUCTIONS = 'eBay 市场调研（通过本机紫鸟店铺浏览器里�
   + '前台：ebay_search（买家看到的搜索结果：排名、价格、运费、发货地、已售件数）。金额美元，eBay 美国站。'
   + '刊登（eBay 开放平台）：先 ebay_listing_defaults（店里的政策和发货地）、ebay_category_suggest（找类目）、ebay_category_aspects（类目必填属性和能用的商品状态），'
   + '再 ebay_listing_preview（eBay 只校验不刊登，返回 preview_id、费用和摘要），把摘要给用户确认后才能 ebay_listing_publish(preview_id, confirm=true) 正式刊登。'
+  + '自家店铺数据（只读）：ebay_orders（订单）、ebay_traffic（流量：曝光、浏览、点击率、转化）、ebay_seller_standards（卖家等级）。'
   + '已有 listing：ebay_listings / ebay_listing_get 查；改内容、改价改库存、增删规格用 ebay_listing_revise_preview，下架用 ebay_listing_end_preview，重新上架用 ebay_listing_relist_preview，'
   + '都只生成「改前 → 改后」的修改记录，用户确认后才能 ebay_listing_apply(change_id, confirm=true) 执行。';
 
@@ -551,6 +620,40 @@ const TOOLS = [
       limit: { type: 'integer', minimum: 1, maximum: 60, default: 60 },
     }, ['keyword']),
     run: search,
+  },
+  {
+    name: 'ebay_orders',
+    description: '自家店铺订单（eBay 官方接口）：最近 N 天的订单，每单的订单号、下单时间、发货 / 付款 / 取消状态、总额、运费、卖家应收、收货国家、最晚发货时间、商品（ItemID、标题、SKU、规格、数量、金额、是否推广售出）；'
+      + '可只看未发货 / 已发货，翻页；附这一页的状态统计、销售额和卖得最多的商品。不返回买家个人信息。',
+    annotations: LISTING_RO,
+    inputSchema: obj({
+      shop: shopArg,
+      days: { type: 'integer', enum: [7, 14, 30, 60, 90], default: 30, description: '最近多少天下的单' },
+      status: { type: 'string', enum: Object.keys(ORDER_STATUS), default: 'all', description: 'all 全部 / unshipped 没发完（含部分发货）/ shipped 发了货（含部分发货）' },
+      page: { type: 'integer', minimum: 1, maximum: 100, default: 1 },
+      page_size: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+    }),
+    run: orders,
+  },
+  {
+    name: 'ebay_traffic',
+    description: '自家店铺流量（eBay 官方流量报告，和 Seller Hub 流量页同源）：按天或按商品的总曝光、商品曝光（搜索结果页 / 店铺页）、浏览、来自搜索的浏览、成交笔数，以及搜索点击率、转化率；可只看某个 ItemID。数据到昨天。',
+    annotations: LISTING_RO,
+    inputSchema: obj({
+      shop: shopArg,
+      days: { type: 'integer', enum: TRAFFIC_DAYS, default: 30, description: '最近多少天（美国太平洋时间，到昨天）' },
+      by: { type: 'string', enum: ['day', 'listing'], default: 'day', description: 'day 按天 / listing 按商品（按曝光从高到低）' },
+      item_id: { type: 'string', description: '只看这个 ItemID' },
+      limit: { type: 'integer', minimum: 1, maximum: 200, default: 30, description: '按商品时最多返回多少条' },
+    }),
+    run: traffic,
+  },
+  {
+    name: 'ebay_seller_standards',
+    description: '卖家表现：eBay 卖家等级（优秀 / 合格 / 不合格）和各项考核指标（交易缺陷率、延迟发货率、未解决纠纷等）的当前值和门槛。',
+    annotations: LISTING_RO,
+    inputSchema: obj({ shop: shopArg }),
+    run: sellerStandards,
   },
   {
     name: 'ebay_listings',

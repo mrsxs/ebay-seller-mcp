@@ -1,7 +1,7 @@
 {
   "name": "ebay-seller-mcp",
-  "version": "1.2.0",
-  "description": "eBay seller MCP server: Terapeak product research (sold prices, sell-through, trends, categories, active competition) and eBay search results as buyers see them — read through the seller's own logged-in Ziniao (紫鸟) store browser — plus listing creation and management (revise, price/stock, end, relist — preview, then apply after confirmation) through the eBay API.",
+  "version": "1.3.0",
+  "description": "eBay seller MCP server: Terapeak product research (sold prices, sell-through, trends, categories, active competition) and eBay search results as buyers see them — read through the seller's own logged-in Ziniao (紫鸟) store browser — plus the store's own orders, traffic and seller standards, and listing creation and management (revise, price/stock, end, relist — preview, then apply after confirmation) through the eBay API.",
   "type": "module",
   "bin": { "ebay-seller-mcp": "bin/ebay-seller-mcp.mjs" },
   "files": ["bin/", "lib/", "README.md"],
