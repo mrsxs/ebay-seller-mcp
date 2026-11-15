@@ -176,7 +176,7 @@ test('冷却：只认明确的 eBay 安全验证；写在数据目录，其他�
 
 test('MCP：握手、工具列表、参数错误在连浏览器之前返回', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'ebm-mcp-'));
-  const env = { ...process.env, EBAY_DATA_DIR: dataDir, EBAY_SHOPS: JSON.stringify([{ name: '测试店', store_id: '12345678901234' }]) };
+  const env = { ...process.env, EBAY_DATA_DIR: dataDir, EBAY_API_KEYS: join(dataDir, 'api-keys.json'), EBAY_SHOPS: JSON.stringify([{ name: '测试店', store_id: '12345678901234' }]) };
   const child = spawn(process.execPath, [join(ROOT, 'bin', 'ebay-seller-mcp.mjs')], { env, stdio: ['pipe', 'pipe', 'inherit'] });
   try {
     let buf = '';
@@ -200,8 +200,14 @@ test('MCP：握手、工具列表、参数错误在连浏览器之前返回', as
     const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } });
     assert.equal(init.result.serverInfo.name, 'ebay-seller-mcp');
     const tools = (await rpc('tools/list', {})).result.tools;
-    assert.deepEqual(tools.map((t) => t.name), ['ebay_shops', 'ebay_research', 'ebay_research_trend', 'ebay_research_categories', 'ebay_research_active', 'ebay_search']);
-    assert.ok(tools.every((t) => t.annotations.readOnlyHint === true));
+    assert.deepEqual(tools.map((t) => t.name), ['ebay_shops', 'ebay_research', 'ebay_research_trend', 'ebay_research_categories', 'ebay_research_active', 'ebay_search',
+      'ebay_listing_defaults', 'ebay_category_suggest', 'ebay_category_aspects', 'ebay_listing_preview', 'ebay_listing_publish']);
+    // 只有预检（上传图片）和发布不是只读
+    assert.deepEqual(tools.filter((t) => t.annotations.readOnlyHint !== true).map((t) => t.name), ['ebay_listing_preview', 'ebay_listing_publish']);
+    assert.match(await text('ebay_listing_publish', { preview_id: '0123456789abcdef', confirm: false }), /confirm 要传 true/);
+    assert.match(await text('ebay_listing_publish', { preview_id: '../x', confirm: true }), /格式不对/);
+    assert.match(await text('ebay_listing_preview', { title: 'x', category_id: '1', description: 'd', images: 'not-array' }), /images 必须是数组/);
+    assert.match(await text('ebay_category_suggest', { query: '  ' }), /query 不能为空/);
     assert.deepEqual(JSON.parse(await text('ebay_shops', {})).shops, [{ name: '测试店', store_id: '12345678901234', default: true }]);
     assert.match(await text('ebay_research', {}), /缺少参数：keyword/);
     assert.match(await text('ebay_research', { keyword: '   ' }), /keyword 不能为空/);

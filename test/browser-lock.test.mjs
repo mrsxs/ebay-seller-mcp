@@ -23,6 +23,10 @@ test('锁端口：同一目录同一端口，不同目录一般不同，落在 2
   assert.equal(lockPort('/a/b'), lockPort('/a/b'));
   assert.notEqual(lockPort('/a/b'), lockPort('/a/c'));
   for (const d of ['/x', '/y/z', 'C:\\data']) assert.ok(lockPort(d) >= 20000 && lockPort(d) < 30000);
+  // 带 key 的锁在另一个端口段，不同 key 不同端口
+  const k1 = lockPort('/a/b', 'darwin', 'publish:aaaa');
+  assert.ok(k1 >= 10000 && k1 < 20000);
+  assert.notEqual(k1, lockPort('/a/b', 'darwin', 'publish:bbbb'));
 });
 
 test('锁：同一进程内串行；出错也释放', async () => {

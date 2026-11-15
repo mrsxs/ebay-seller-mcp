@@ -1,10 +1,12 @@
 # ebay-seller-mcp
 
-eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国站的真实成交均价、成交件数、售罄率、卖家数、成交总额、热卖 listing、每日 / 周 / 月走势、类目分布、在售竞争）和 **eBay 前台搜索**（买家看到的排名、价格、运费、发货地、已售件数）。
+eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国站的真实成交均价、成交件数、售罄率、卖家数、成交总额、热卖 listing、每日 / 周 / 月走势、类目分布、在售竞争）、**eBay 前台搜索**（买家看到的排名、价格、运费、发货地、已售件数），和**刊登**（预检 → 用户确认后发布，支持多规格）。
 
-所有数据都从**本机紫鸟（Ziniao）店铺浏览器里已登录的 eBay Seller Hub** 取：Terapeak 用 Seller Hub Research 页面自己的接口，前台搜索在一个专用标签页里真实打开搜索页再读页面。不走 eBay 开放平台，不需要 App Key。请求走那家店的紫鸟代理 IP。
+调研和搜索从**本机紫鸟（Ziniao）店铺浏览器里已登录的 eBay Seller Hub** 取：Terapeak 用 Seller Hub Research 页面自己的接口，前台搜索在一个专用标签页里真实打开搜索页再读页面，不需要 App Key，请求走那家店的紫鸟代理 IP。
+刊登走 **eBay 开放平台**（需要自己的开发者密钥和店铺授权，见「刊登」）。
 
-- **只读**：不改 listing、不改价、不发消息。
+- **调研只读**：调研和搜索工具不改 listing、不改价、不发消息。
+- **刊登两步走**：`ebay_listing_preview` 只让 eBay 校验、不刊登；`ebay_listing_publish` 只能发布预检通过的原样内容，并且要 `confirm: true`（客户端应先把预检摘要给用户确认）。不改已有 listing、不改价、不下架。
 - **遇到验证就停**：eBay 浏览器检查页（Pardon Our Interruption）一直不放行、验证码、请求太频繁、请求被转到验证 / 登录页时，不重试，并且这家店 10 分钟内不再发请求（记在数据目录的 `cooldown.json`，用同一个数据目录的其他 MCP 进程也会停；删掉它可立即恢复）。
 - **少发请求**：每个工具一次调用只发 1 个请求（前台搜索是打开 1 个页面）；相同查询 Terapeak 30 分钟、前台搜索 10 分钟内直接用缓存。
 - 零依赖，Node.js ≥ 22。
@@ -35,7 +37,8 @@ eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国
 |---|---|
 | `EBAY_SHOPS` | 店铺数组（JSON）。`store_id` 是**紫鸟店铺 ID**（`ziniao-cli store list` 里的 storeId），`name` 随便起，`default: true` 标默认店（不标则第一家）。 |
 | `EBAY_STORE_ID` | 只有一家店时可以只设紫鸟店铺 ID，代替 `EBAY_SHOPS`。 |
-| `EBAY_DATA_DIR` | 浏览器锁和冷却文件目录，默认 `~/.ebay-seller-mcp`。多个程序用同一个紫鸟浏览器时共用这个目录，才能互相排队。 |
+| `EBAY_DATA_DIR` | 浏览器锁、冷却文件、刊登预检记录目录，默认 `~/.ebay-seller-mcp`。多个程序用同一个紫鸟浏览器时共用这个目录，才能互相排队。 |
+| `EBAY_API_KEYS` | 刊登用：eBay 开发者密钥和店铺授权文件，默认 `~/.config/ebay-seller-mcp/api-keys.json`。 |
 | `ZINIAO_CLI` | `ziniao-cli` 的路径（自动查找失败时）。 |
 
 配置写错时服务器照常启动，调用任何工具都会返回具体哪里错了。
@@ -50,6 +53,11 @@ eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国
 | `ebay_research_categories` | Terapeak 类目分布：关键词的成交落在哪些类目，可一层层往下钻；类目 ID 可用于其他工具筛选 |
 | `ebay_research_active` | Terapeak 在售：在售 listing 数、平均售价、平均运费、包邮占比、付费推广占比、价格区间；在售 listing（价格、运费、关注人数、是否推广、上架日期） |
 | `ebay_search` | eBay 前台搜索：排名位置、标题、新旧、价格（含多规格价格区间、划线原价）、一口价 / 拍卖 / 可议价、运费、发货地、已售件数；可按排序、新旧、只看一口价、价格区间、类目筛选，每页 60 条，最多 3 页 |
+| `ebay_listing_defaults` | 刊登：店里的运费 / 退货 / 付款政策，最近在售商品常用的发货地和政策组合（预检的默认值），最近用过的类目 |
+| `ebay_category_suggest` | 刊登：按英文关键词推荐叶子类目（ID 和完整路径） |
+| `ebay_category_aspects` | 刊登：类目的商品属性（必填 / 建议 / 可选、可选值、能否做规格名）、能用的商品状态、能否多规格 |
+| `ebay_listing_preview` | 刊登预检（不刊登）：上传图片到 eBay 图片服务，让 eBay 按真实规则校验，返回错误 / 警告、刊登费用、内容摘要和 `preview_id`（24 小时有效） |
+| `ebay_listing_publish` | 正式刊登：按 `preview_id` 发布预检通过的原样内容（`confirm: true`）；同一个 `preview_id` 重复调用不会重复刊登 |
 
 ## 口径
 
@@ -60,9 +68,29 @@ eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国
 - 前台搜索按这家店紫鸟浏览器的收货地显示运费；`sold` 是卡片上的「已售」件数（「1.2K+ sold」取下限）。页面上分不出哪些是广告位，推广情况看 `ebay_research_active`。
 - 前台搜索在窗口最小化时第一次打开可能要过 eBay 的浏览器检查（最多等 45 秒，通过一次后同一标签页之后的搜索 2～4 秒）。
 
+## 刊登
+
+刊登用 eBay 开放平台（Trading API 刊登、Media API 传图、Account / Taxonomy / Metadata API 查政策和类目），需要：
+
+1. **开发者密钥**：在 [developer.ebay.com](https://developer.ebay.com) 建 Production 密钥集（处理好 Marketplace Account Deletion：不保存 eBay 用户数据可申请豁免），
+   在 User Tokens 里建一个 RuName 并开启 OAuth。把 `app_id`、`cert_id`、`ru_name` 写进 `~/.config/ebay-seller-mcp/api-keys.json`（`chmod 600`）：
+   ```json
+   { "app_id": "...", "cert_id": "...", "ru_name": "..." }
+   ```
+2. **店铺授权**：在终端运行
+   ```bash
+   EBAY_SHOPS='[{"name":"美国站","store_id":"12345678901234"}]' npx -y ebay-seller-mcp@latest auth --shop 美国站
+   # 或 npx -y ebay-seller-mcp@latest auth --store-id 12345678901234
+   ```
+   会在**这家店的紫鸟店铺浏览器**里打开 eBay 授权页（不在别的浏览器里登录卖家账号），点「Agree」后授权保存到上面的文件，约 18 个月有效。
+   申请的权限：订单 / 流量 / 库存 / 广告 / 账户只读、财务、身份、店铺只读，加上刊登（`sell.inventory`）。
+
+刊登口径：一口价、GTC 长期在售、美元、eBay 美国站；运费 / 退货 / 付款用店里已有的业务政策（不传就用最近在售商品最常用的组合）；
+图片上传后 eBay 保留约 30 天，同一张图在有效期内不重复上传；预检记录 24 小时内可发布。发布带 UUID，网络中断后用同一个 `preview_id` 重发，eBay 会认出已刊登的商品而不会重复刊登。
+
 ## 说明
 
-非官方工具：用的是 eBay Seller Hub 页面自己调用的内部接口和公开搜索页，平台改版可能导致失效。请求和你在 Seller Hub 里手动查看一样走店铺浏览器，但请控制调用频率，遇到验证时先在浏览器里手动处理，不要反复重试；使用时请遵守 eBay 的用户协议。
+非官方工具：调研和搜索用的是 eBay Seller Hub 页面自己调用的内部接口和公开搜索页，平台改版可能导致失效。请求和你在 Seller Hub 里手动查看一样走店铺浏览器，但请控制调用频率，遇到验证时先在浏览器里手动处理，不要反复重试；使用时请遵守 eBay 的用户协议。
 
 ## 开发
 

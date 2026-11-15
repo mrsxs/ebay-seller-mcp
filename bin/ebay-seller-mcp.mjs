@@ -1,16 +1,23 @@
 #!/usr/bin/env node
-// eBay 卖家 MCP（stdio）：Terapeak 商品调研（已售成交、走势、类目、在售竞争）和 eBay 前台搜索。
-// 全部通过本机紫鸟店铺浏览器里已登录的 eBay Seller Hub 页面取数（不走开放平台、不需要 App Key），只读。
+// eBay 卖家 MCP（stdio）：Terapeak 商品调研（已售成交、走势、类目、在售竞争）、eBay 前台搜索，和刊登（预检 → 确认后发布）。
+// 调研和搜索通过本机紫鸟店铺浏览器里已登录的 eBay Seller Hub 页面取数（只读）；刊登走 eBay 开放平台（开发者密钥 + 店铺授权）。
 // 协议：每行一条 JSON-RPC 2.0 消息；stdout 只写协议消息，诊断写 stderr。
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { withBrowserLock } from '../lib/browser-lock.mjs';
+import { authorizeStore } from '../lib/auth-flow.mjs';
+import { LockBusyError, withBrowserLock, withLock } from '../lib/browser-lock.mjs';
 import { createBrowserSession, EBAY_SITE, navigateAndWait, PageBlockedError, SEARCH_SITE } from '../lib/browser.mjs';
 import { CooldownError, createCooldown, isVerifyMessage } from '../lib/cooldown.mjs';
+import { ApiError, describe, parseFees, restCall, TokenRejectedError, tradingCall, uploadImage } from '../lib/ebay-api.mjs';
 import { createTerapeakApi, EbayError } from '../lib/ebay.mjs';
+import {
+  activeItemIds, allImages, applyDefaults, buildItemXml, createImageUploader, createPreviewStore, ListingError, listingSummary, newPreviewId,
+  newUuid, normalizeListing, parseItemDefaults, pickDefaults, publishPreview,
+} from '../lib/listing.mjs';
+import { AuthError, createTokenProvider, defaultKeysFile, LISTING_SCOPES } from '../lib/oauth.mjs';
 import { CONDITIONS, parseResults, readSearchPage, searchUrl, SORTS } from '../lib/search.mjs';
 import { ShopConfigError, parseShops, resolveShop } from '../lib/shops.mjs';
 import {
@@ -53,7 +60,7 @@ const exclusive = (fn) => {
 };
 
 // 结果缓存：Terapeak 是按天汇总的数据，前台搜索变化快一些；同样的查询短时间内不重复发请求
-const CACHE_TTL = { research: 30 * 60_000, search: 10 * 60_000 };
+const CACHE_TTL = { research: 30 * 60_000, search: 10 * 60_000, api: 30 * 60_000, taxonomy: 24 * 3600_000 };
 const cache = new Map();
 const inflight = new Map();
 /** 命中缓存时不碰浏览器；同样的查询正在跑时等它的结果，不再发第二次。出错不缓存 */
@@ -77,7 +84,7 @@ async function cachedResult(kind, key, load) {
 }
 
 const isUserError = (err) => err instanceof QueryError || err instanceof CooldownError || err instanceof EbayError || err instanceof PageBlockedError
-  || err instanceof ShopConfigError;
+  || err instanceof ShopConfigError || err instanceof AuthError || err instanceof ApiError || err instanceof ListingError;
 const cooldown = createCooldown({ dir: DATA_DIR });
 
 /** 在某家店的工作标签页里执行：fn({ cdp, graphql, fresh })；site 决定用哪个标签页，home 是新开标签页时直接打开的地址 */
@@ -106,6 +113,8 @@ function precheck(a) {
     if (!k) throw new QueryError('keyword 不能为空');
     if (k.length > 200) throw new QueryError('keyword 最多 200 个字符');
   }
+  if (a.query !== undefined && !a.query.trim()) throw new QueryError('query 不能为空');
+  if (a.query !== undefined && a.query.length > 350) throw new QueryError('query 最多 350 个字符');
   if (a.category_id !== undefined && !/^\d{1,12}$/.test(a.category_id)) throw new QueryError('category_id 应是数字类目 ID（用 ebay_research_categories 查）');
   for (const k of ['price_min', 'price_max']) if (a[k] !== undefined && !(Number.isFinite(a[k]) && a[k] >= 0)) throw new QueryError(`${k} 应是不小于 0 的数字（美元）`);
   if (a.price_min !== undefined && a.price_max !== undefined && a.price_min > a.price_max) throw new QueryError('price_min 不能大于 price_max');
@@ -193,10 +202,186 @@ const shops = () => {
   };
 };
 
+// ---- 刊登（eBay 开放平台）：密钥 + 店铺授权在 EBAY_API_KEYS 指向的文件里 ----
+const KEYS_FILE = defaultKeysFile();
+const tokens = createTokenProvider({ file: KEYS_FILE });
+const previews = createPreviewStore({ dir: DATA_DIR });
+const AUTH_HINT = (storeId) => `npx -y ebay-seller-mcp@latest auth --store-id ${storeId}`;
+
+/** 用这家店的用户令牌调接口；令牌被拒（401 / 授权错误）时换一次新令牌再试（被拒的请求不会生效） */
+async function withUserToken(shop, fn, { listing = false } = {}) {
+  const get = () => tokens.userToken(shop.storeId, listing ? { needScopes: LISTING_SCOPES } : {});
+  try {
+    return await fn(await get());
+  } catch (err) {
+    if (!(err instanceof TokenRejectedError)) throw err;
+    tokens.forget(shop.storeId);
+    try {
+      return await fn(await get());
+    } catch (again) {
+      if (again instanceof TokenRejectedError) throw new AuthError(`eBay 拒绝了这家店的授权（可能被撤销）：运行「${AUTH_HINT(shop.storeId)}」重新授权`);
+      throw again;
+    }
+  }
+}
+
+const appGet = async (path) => {
+  try {
+    return await restCall({ token: await tokens.appToken(), path });
+  } catch (err) {
+    if (!(err instanceof TokenRejectedError)) throw err;
+    throw new AuthError('eBay 拒绝了开发者密钥的应用令牌：到 developer.ebay.com 的 Application Keys 检查密钥集是否被停用');
+  }
+};
+
+const failIf = (r, what) => {
+  if (r.ack === 'Failure' || r.ack === 'PartialFailure') throw new ApiError(`${what}失败：${describe(r.errors).join('；') || r.ack}`);
+  return r;
+};
+
+/** 店里的运费 / 退货 / 付款政策 + 最近几条在售 listing 用的发货地和政策（当默认值） */
+function loadDefaults(shop) {
+  return cachedResult('api', `${shop.storeId}|defaults`, () => withUserToken(shop, async (token) => {
+    const get = (path) => restCall({ token, path });
+    const [f, r, p] = await Promise.all(['fulfillment_policy', 'return_policy', 'payment_policy'].map((k) => get(`/sell/account/v1/${k}?marketplace_id=EBAY_US`)));
+    const policies = {
+      fulfillment: (f.fulfillmentPolicies ?? []).map((x) => ({
+        id: String(x.fulfillmentPolicyId), name: x.name, handling_days: x.handlingTime?.value ?? null,
+        services: (x.shippingOptions ?? []).flatMap((o) => (o.shippingServices ?? []).map((s) => ({ scope: o.optionType, service: s.shippingServiceCode, free: s.freeShipping === true, cost: s.shippingCost ? Number(s.shippingCost.value) : null }))),
+      })),
+      return: (r.returnPolicies ?? []).map((x) => ({ id: String(x.returnPolicyId), name: x.name, returns_accepted: x.returnsAccepted === true, period_days: x.returnPeriod?.value ?? null, paid_by: x.returnShippingCostPayer ?? null })),
+      payment: (p.paymentPolicies ?? []).map((x) => ({ id: String(x.paymentPolicyId), name: x.name, immediate_pay: x.immediatePay === true })),
+    };
+    const sell = failIf(await tradingCall({ token, call: 'GetMyeBaySelling', body: '<ActiveList><Include>true</Include><Sort>StartTimeDescending</Sort><Pagination><EntriesPerPage>5</EntriesPerPage><PageNumber>1</PageNumber></Pagination></ActiveList>' }), '读在售 listing ');
+    const items = [];
+    for (const id of activeItemIds(sell.xml).slice(0, 3)) {
+      const g = await tradingCall({ token, call: 'GetItem', body: `<ItemID>${id}</ItemID><DetailLevel>ReturnAll</DetailLevel>` });
+      if (g.ack !== 'Failure') items.push(parseItemDefaults(g.xml));
+    }
+    return { shop: shop.name, ebay_user_id: tokens.grantInfo(shop.storeId).ebay_user_id, policies, defaults: pickDefaults(items), recent_categories: [...new Set(items.map((x) => x.category_id).filter(Boolean))] };
+  }));
+}
+
+const listingDefaults = async (a) => {
+  const out = await loadDefaults(shopFor(a.shop));
+  return { ...out, note: 'policies：店里的运费（fulfillment）/ 退货（return）/ 付款（payment）政策；defaults：最近在售 listing 最常用的发货地和政策组合，ebay_listing_preview 不传 policies / location 时就用它。'
+    + 'recent_categories 是最近 listing 用的类目 ID。' };
+};
+
+const categorySuggest = (a) => cachedResult('taxonomy', `suggest|${a.query.trim().toLowerCase()}`, async () => {
+  const j = await appGet(`/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q=${encodeURIComponent(a.query.trim())}`);
+  const list = (j.categorySuggestions ?? []).map((s) => ({
+    category_id: s.category?.categoryId, name: s.category?.categoryName,
+    path: [...(s.categoryTreeNodeAncestors ?? [])].sort((x, y) => x.categoryTreeNodeLevel - y.categoryTreeNodeLevel).map((x) => x.categoryName).concat(s.category?.categoryName).join(' > '),
+  }));
+  return { query: a.query.trim(), suggestions: list.slice(0, 10),
+    note: 'eBay 美国站按关键词推荐的叶子类目（刊登只能用叶子类目），排在前面的更匹配。也可以参考 ebay_listing_defaults 的 recent_categories（店里已有商品用的类目）和 ebay_research_categories（这类商品实际成交最多的类目）。' };
+});
+
+const categoryAspects = (a) => cachedResult('taxonomy', `aspects|${a.category_id}`, async () => {
+  const id = a.category_id;
+  const [asp, cond, struct] = await Promise.all([
+    appGet(`/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${id}`),
+    appGet(`/sell/metadata/v1/marketplace/EBAY_US/get_item_condition_policies?filter=${encodeURIComponent(`categoryIds:{${id}}`)}`).catch((err) => ({ error: err.message })),
+    appGet(`/sell/metadata/v1/marketplace/EBAY_US/get_listing_structure_policies?filter=${encodeURIComponent(`categoryIds:{${id}}`)}`).catch((err) => ({ error: err.message })),
+  ]);
+  const order = { required: 0, recommended: 1, optional: 2 };
+  const aspects = (asp.aspects ?? []).map((x) => {
+    const c = x.aspectConstraint ?? {};
+    const values = (x.aspectValues ?? []).map((v) => v.localizedValue);
+    return {
+      name: x.localizedAspectName,
+      usage: c.aspectRequired ? 'required' : String(c.aspectUsage ?? 'OPTIONAL').toLowerCase(),
+      mode: c.aspectMode === 'SELECTION_ONLY' ? 'select_only' : 'free_text',
+      multi: c.itemToAspectCardinality === 'MULTI',
+      for_variations: c.aspectEnabledForVariations === true,
+      max_length: c.aspectMaxLength ?? null,
+      values: values.slice(0, 25), values_total: values.length,
+    };
+  }).sort((x, y) => (order[x.usage] ?? 3) - (order[y.usage] ?? 3));
+  const condPolicy = cond.itemConditionPolicies?.[0];
+  return {
+    category_id: id,
+    aspects: aspects.filter((x) => x.usage !== 'optional').concat(aspects.filter((x) => x.usage === 'optional').slice(0, 20)),
+    optional_more: Math.max(0, aspects.filter((x) => x.usage === 'optional').length - 20),
+    conditions: condPolicy ? (condPolicy.itemConditions ?? []).map((c) => ({ condition_id: Number(c.conditionId), name: c.conditionDescription })) : null,
+    condition_required: condPolicy?.itemConditionRequired ?? null,
+    variations_supported: struct.listingStructurePolicies?.[0]?.variationsSupported ?? null,
+    note: 'aspects：这个类目的商品属性（required 必填，recommended 建议填，optional 可选，只列前 20 个）；select_only 只能从 values 里选，free_text 可以自己写（values 是常见值）；'
+      + 'multi 可以填多个值；for_variations 可以当多规格的规格名。conditions：能用的商品状态（condition_id）。variations_supported：这个类目能不能做多规格。',
+  };
+});
+
+const uploadImages = (token) => createImageUploader({
+  dir: DATA_DIR,
+  upload: async (img, data) => {
+    try {
+      return await uploadImage({ token, ref: img.ref, data, filename: basename(img.ref) });
+    } catch (err) {
+      if (err instanceof ApiError && !(err instanceof TokenRejectedError)) throw new ListingError(`${basename(img.ref)}：${err.message}`);
+      throw err;
+    }
+  },
+});
+
+const listingPreview = async (a) => {
+  const shop = shopFor(a.shop);
+  const { shop: _s, ...input } = a;
+  const defaults = await loadDefaults(shop);
+  const listing = applyDefaults(normalizeListing(input), defaults);
+  return withUserToken(shop, async (token) => {
+    const pictures = await uploadImages(token)(allImages(listing));
+    const id = newPreviewId();
+    const uuid = newUuid();
+    const itemXml = buildItemXml(listing, { pictures, uuid });
+    const v = await tradingCall({ token, call: 'VerifyAddFixedPriceItem', body: itemXml, timeoutMs: 120_000 });
+    const ok = v.ack === 'Success' || v.ack === 'Warning';
+    const fees = parseFees(v.xml);
+    const summary = listingSummary(listing, defaults);
+    if (ok) previews.save({ id, store_id: shop.storeId, created_at: new Date().toISOString(), uuid, item_xml: itemXml, summary, fees, status: 'ready' });
+    return {
+      shop: shop.name, ok, preview_id: ok ? id : null, errors: describe(v.errors), warnings: describe(v.warnings), fees, summary,
+      note: ok
+        ? 'eBay 校验通过（还没有刊登）。把 summary（标题、类目、价格 / 规格、数量、政策、发货地）和 fees（刊登费用）给用户核对；用户明确同意后，用 preview_id 调 ebay_listing_publish 发布。24 小时内有效；要改内容就重新预检。'
+        : 'eBay 校验没通过（没有刊登）：按 errors 改参数后重新预检。warnings 不影响刊登，但最好处理。',
+    };
+  }, { listing: true });
+};
+
+const listingPublish = async (a) => {
+  const shop = shopFor(a.shop);
+  if (a.confirm !== true) throw new QueryError('confirm 要传 true：发布前必须把预检摘要给用户看过并得到明确同意');
+  previews.load(a.preview_id); // 先查格式和记录在不在，再拿令牌
+  // 这条预检的跨进程锁：同一时间只有一个任务在发它；进程退出锁就释放
+  const lock = (id, fn) => withLock(DATA_DIR, fn, { key: `publish:${id}`, what: '这条预检的发布', waitMs: 5000, owner: `ebay-seller-mcp ${process.pid}` }).catch((err) => {
+    if (err instanceof LockBusyError) throw new ListingError('这条预检正在被另一个任务发布，等它结束后再用同一个 preview_id 调 ebay_listing_publish 查结果；不要重新预检，也不要换别的方式刊登。');
+    throw err;
+  });
+  // 令牌被拒时 withUserToken 换令牌重来：被拒的请求没有生效
+  const r = await withUserToken(shop, (token) => publishPreview({
+    previews, id: a.preview_id, storeId: shop.storeId, describe, lock,
+    add: (xml) => tradingCall({ token, call: 'AddFixedPriceItem', body: xml, timeoutMs: 180_000 }),
+  }), { listing: true });
+  if (!r.ok && r.still_unknown) {
+    return { shop: shop.name, ok: false, outcome_unknown: true, errors: r.errors, warnings: r.warnings,
+      note: '这次重发 eBay 报了错，但之前那次发布的结果仍然不确定（可能已经刊登）。先到 Seller Hub → Listings 看有没有这个商品：有就不用再发；'
+        + '没有的话稍后用同一个 preview_id 再试。只有确认 Seller Hub 里没有这个商品时，才可以重新预检（新预检会当成新商品刊登）。' };
+  }
+  if (!r.ok) return { shop: shop.name, ok: false, errors: r.errors, warnings: r.warnings, note: 'eBay 拒绝了刊登（没有刊登）：按 errors 改参数后重新预检、确认、发布。' };
+  const url = r.item_id ? `https://www.ebay.com/itm/${r.item_id}` : null;
+  const note = r.already_published
+    ? (r.item_id ? '这条预检之前已经刊登过了，没有重复刊登，这是原来的 ItemID。' : '这条预检之前已经刊登过了（eBay 按 UUID 认出来），但没返回 ItemID，请到 Seller Hub → Listings 查看。')
+    : '已刊登。刊登后的修改请在 Seller Hub 里做。';
+  return { shop: shop.name, ok: true, item_id: r.item_id, url, already_published: r.already_published === true, summary: r.rec.summary,
+    ...(r.xml ? { fees: parseFees(r.xml), warnings: r.warnings } : {}), note };
+};
+
 const INSTRUCTIONS = 'eBay 市场调研（通过本机紫鸟店铺浏览器里已登录的 eBay Seller Hub 取数，只读）。'
   + 'Terapeak（已售成交，最多 3 年）：ebay_research（成交均价、成交件数、售罄率、卖家数、成交总额 + 按成交件数排的 listing）、ebay_research_trend（每天 / 周 / 月的成交均价和件数）、'
   + 'ebay_research_categories（各类目成交件数，可往下钻）、ebay_research_active（在售 listing 数、均价、推广占比 + 在售 listing）。'
-  + '前台：ebay_search（买家看到的搜索结果：排名、价格、运费、发货地、已售件数）。金额美元，eBay 美国站。';
+  + '前台：ebay_search（买家看到的搜索结果：排名、价格、运费、发货地、已售件数）。金额美元，eBay 美国站。'
+  + '刊登（eBay 开放平台）：先 ebay_listing_defaults（店里的政策和发货地）、ebay_category_suggest（找类目）、ebay_category_aspects（类目必填属性和能用的商品状态），'
+  + '再 ebay_listing_preview（eBay 只校验不刊登，返回 preview_id、费用和摘要），把摘要给用户确认后才能 ebay_listing_publish(preview_id, confirm=true) 正式刊登。';
 
 // ---- 工具定义 ----
 const shopArg = { type: 'string', description: '店铺名或紫鸟店铺 ID；不填 = 默认店（见 ebay_shops）' };
@@ -207,6 +392,8 @@ const pageArg = { type: 'integer', minimum: 1, maximum: 20, default: 1 };
 const RO = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
 const LOCAL_RO = { ...RO, openWorldHint: false };
 const obj = (properties, required = []) => ({ type: 'object', additionalProperties: false, properties, ...(required.length ? { required } : {}) });
+const LISTING_RO = { ...RO, idempotentHint: true };
+const imageArg = { type: 'string', description: '图片文件的完整路径（绝对路径，JPG / PNG / WEBP 等，≤12MB，最长边建议 ≥1600 像素）或 https 网址' };
 
 const TOOLS = [
   { name: 'ebay_shops', description: '列出已配置的 eBay 店铺（名称、紫鸟店铺 ID、哪家是默认店）。', annotations: LOCAL_RO, inputSchema: obj({}), run: shops },
@@ -256,6 +443,67 @@ const TOOLS = [
     }, ['keyword']),
     run: search,
   },
+  {
+    name: 'ebay_listing_defaults',
+    description: '刊登前先看：这家店的运费 / 退货 / 付款政策（ID、名称、运费方式），以及最近在售商品常用的发货地和政策组合（预检不传 policies / location 时用它）、最近用过的类目。',
+    annotations: LISTING_RO,
+    inputSchema: obj({ shop: shopArg }),
+    run: listingDefaults,
+  },
+  {
+    name: 'ebay_category_suggest',
+    description: '按商品关键词（英文）找 eBay 美国站的刊登类目（叶子类目 ID 和完整路径）。',
+    annotations: LISTING_RO,
+    inputSchema: obj({ query: { type: 'string', minLength: 1, description: '商品关键词（英文），如 "miniature camouflage net diorama"' } }, ['query']),
+    run: categorySuggest,
+  },
+  {
+    name: 'ebay_category_aspects',
+    description: '某个类目的刊登要求：商品属性（必填 / 建议 / 可选，可选值，能否当多规格的规格名）、能用的商品状态（condition_id）、能不能做多规格。',
+    annotations: LISTING_RO,
+    inputSchema: obj({ category_id: { type: 'string', description: '叶子类目 ID（ebay_category_suggest 查）' } }, ['category_id']),
+    run: categoryAspects,
+  },
+  {
+    name: 'ebay_listing_preview',
+    description: '刊登预检（不会刊登）：把图片上传到 eBay 图片服务，再让 eBay 按真实刊登规则校验（必填属性、类目、价格、政策等），返回错误 / 警告、刊登费用和要发布的内容摘要。'
+      + '校验通过才给 preview_id（24 小时有效）。一口价、GTC 长期在售、美元、eBay 美国站。单规格传 price + quantity；多规格传 variations。',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    inputSchema: obj({
+      shop: shopArg,
+      title: { type: 'string', description: '英文标题，最多 80 个字符；放买家会搜的词' },
+      category_id: { type: 'string', description: '叶子类目 ID（ebay_category_suggest 查）' },
+      condition_id: { type: 'integer', default: 1000, description: '商品状态：全新 = 1000（用 ebay_category_aspects 查这个类目能用哪些）' },
+      condition_description: { type: 'string', description: '状态补充说明（非全新时用）' },
+      description: { type: 'string', description: '商品描述（英文）：HTML，或纯文本（空行分段）' },
+      images: { type: 'array', items: imageArg, description: '商品图 1~24 张，第一张是主图' },
+      aspects: { type: 'object', description: '商品属性（Item specifics），如 {"Brand": "Unbranded", "Material": "Polyester", "Color": ["Green", "Brown"]}；类目必填的都要填' },
+      price: { type: 'number', description: '单规格：一口价（美元，两位小数）' },
+      quantity: { type: 'integer', description: '单规格：可售数量' },
+      sku: { type: 'string', description: '单规格：商家编码（可选）' },
+      best_offer: { type: 'boolean', description: '单规格：是否接受议价，默认 false' },
+      variations: {
+        type: 'object',
+        description: '多规格：{ "specifics": ["Size", "Color"], "picture_by": "Color", "items": [{ "sku": "NET-S-GRN", "price": 3.99, "quantity": 50, "values": {"Size": "10x15cm", "Color": "MC Camo"}, "image": "/path/MC.jpg" }] }。'
+          + 'specifics 是规格名（最多 5 个，不要和 aspects 重名）；items 每个规格的价格、数量、规格值（每个规格名都要有值，组合不能重复）；picture_by 按哪个规格配图（每个值都要有 image）。',
+      },
+      policies: { type: 'object', description: '{ fulfillment_policy_id, return_policy_id, payment_policy_id }；不传用 ebay_listing_defaults 的默认组合' },
+      location: { type: 'object', description: '发货地 { country: "CN", location: "Shenzhen, Guangdong", postal_code }；不传用店里已有商品的' },
+    }, ['title', 'category_id', 'description', 'images']),
+    run: listingPreview,
+  },
+  {
+    name: 'ebay_listing_publish',
+    description: '正式刊登（会在 eBay 上架、可能产生刊登费）：只能发布 ebay_listing_preview 校验通过的内容（按 preview_id，内容不能再改）。'
+      + '必须先把预检摘要和费用给用户看、用户明确同意后才能调用，confirm 传 true。同一个 preview_id 重复调用不会重复刊登。',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: obj({
+      shop: shopArg,
+      preview_id: { type: 'string', description: 'ebay_listing_preview 返回的 preview_id' },
+      confirm: { type: 'boolean', description: '用户已经看过预检摘要并明确同意刊登时传 true' },
+    }, ['preview_id', 'confirm']),
+    run: listingPublish,
+  },
 ];
 const BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));
 
@@ -271,6 +519,8 @@ function checkArgs(tool, args) {
     if (spec.type === 'number' && !(typeof value === 'number' && Number.isFinite(value))) throw new QueryError(`${key} 必须是数字。`);
     if (spec.type === 'string' && typeof value !== 'string') throw new QueryError(`${key} 必须是字符串。`);
     if (spec.type === 'boolean' && typeof value !== 'boolean') throw new QueryError(`${key} 必须是 true / false。`);
+    if (spec.type === 'array' && !Array.isArray(value)) throw new QueryError(`${key} 必须是数组。`);
+    if (spec.type === 'object' && (value === null || typeof value !== 'object' || Array.isArray(value))) throw new QueryError(`${key} 必须是对象。`);
     if (spec.enum && !spec.enum.includes(value)) throw new QueryError(`${key} 只能是：${spec.enum.join('、')}`);
     if (spec.minimum !== undefined && value < spec.minimum) throw new QueryError(`${key} 不能小于 ${spec.minimum}。`);
     if (spec.maximum !== undefined && value > spec.maximum) throw new QueryError(`${key} 不能大于 ${spec.maximum}。`);
@@ -319,34 +569,63 @@ const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', 
 
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
   process.stdout.write(`ebay-seller-mcp ${VERSION}
-eBay 卖家 MCP（stdio）：通过本机紫鸟店铺浏览器里已登录的 eBay Seller Hub 做 Terapeak 商品调研和前台搜索。
+eBay 卖家 MCP（stdio）：通过本机紫鸟店铺浏览器里已登录的 eBay Seller Hub 做 Terapeak 商品调研和前台搜索；通过 eBay 开放平台刊登（预检 → 确认后发布）。
+
+命令：
+  ebay-seller-mcp                          启动 MCP 服务（stdio）
+  ebay-seller-mcp auth --store-id <ID>     授权店铺（刊登用）：在这家店的紫鸟店铺浏览器里打开 eBay 授权页，点同意后保存授权
+  ebay-seller-mcp auth --shop <店铺名>      同上，按 EBAY_SHOPS 里的店铺名
 
 环境变量：
   EBAY_SHOPS     店铺数组 JSON，如 [{"name":"美国站","store_id":"12345678901234","default":true}]
   EBAY_STORE_ID  只有一家店时可以只设紫鸟店铺 ID
-  EBAY_DATA_DIR  浏览器锁 / 冷却文件目录（默认 ~/.ebay-seller-mcp）
+  EBAY_DATA_DIR  浏览器锁 / 冷却文件 / 预检记录目录（默认 ~/.ebay-seller-mcp）
+  EBAY_API_KEYS  eBay 开发者密钥和店铺授权文件（默认 ~/.config/ebay-seller-mcp/api-keys.json）
   ZINIAO_CLI     ziniao-cli 命令路径（默认自动查找）
 `);
   process.exit(0);
 }
 
-createInterface({ input: process.stdin }).on('line', async (line) => {
-  if (!line.trim()) return;
-  let message;
-  try {
-    message = JSON.parse(line);
-  } catch {
-    send({ id: null, error: { code: -32700, message: 'JSON 解析失败' } });
-    return;
-  }
-  if (!message || typeof message !== 'object' || Array.isArray(message)) {
-    send({ id: null, error: { code: -32600, message: '请求必须是 JSON 对象' } });
-    return;
-  }
-  try {
-    const result = await handle(message);
-    if (message.id !== undefined && result !== undefined) send({ id: message.id, result });
-  } catch (error) {
-    if (message.id !== undefined) send({ id: message.id, error: { code: error.code ?? -32603, message: String(error.message ?? error) } });
-  }
-}).on('close', () => process.exit(0));
+if (process.argv[2] === 'auth') {
+  const argOf = (name) => {
+    const i = process.argv.indexOf(name);
+    return i > 0 ? process.argv[i + 1] : undefined;
+  };
+  const run = async () => {
+    const storeIdArg = argOf('--store-id');
+    let storeId;
+    if (storeIdArg !== undefined) {
+      if (!/^\d{5,24}$/.test(storeIdArg)) throw new QueryError('--store-id 应是紫鸟店铺 ID（ziniao-cli store list 里的 storeId）');
+      storeId = storeIdArg;
+    } else {
+      storeId = shopFor(argOf('--shop')).storeId;
+    }
+    const r = await authorizeStore({ storeId, file: KEYS_FILE, log: (m) => process.stderr.write(`${m}\n`) });
+    process.stdout.write(`授权成功：eBay 账号 ${r.ebay_user_id ?? '（未知）'}，有效期到 ${r.expires_at.slice(0, 10)}。授权保存在 ${KEYS_FILE}\n`);
+  };
+  run().then(() => process.exit(0), (err) => {
+    process.stderr.write(`授权失败：${err?.message ?? err}\n`);
+    process.exit(1);
+  });
+} else {
+  createInterface({ input: process.stdin }).on('line', async (line) => {
+    if (!line.trim()) return;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      send({ id: null, error: { code: -32700, message: 'JSON 解析失败' } });
+      return;
+    }
+    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+      send({ id: null, error: { code: -32600, message: '请求必须是 JSON 对象' } });
+      return;
+    }
+    try {
+      const result = await handle(message);
+      if (message.id !== undefined && result !== undefined) send({ id: message.id, result });
+    } catch (error) {
+      if (message.id !== undefined) send({ id: message.id, error: { code: error.code ?? -32603, message: String(error.message ?? error) } });
+    }
+  }).on('close', () => process.exit(0));
+}
