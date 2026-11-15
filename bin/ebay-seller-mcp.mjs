@@ -17,6 +17,8 @@ import {
   activeItemIds, allImages, applyDefaults, buildItemXml, createImageUploader, createPreviewStore, ListingError, listingSummary, newPreviewId,
   newUuid, normalizeListing, parseItemDefaults, pickDefaults, publishPreview,
 } from '../lib/listing.mjs';
+import { applyChange, buildReviseXml, END_REASONS, planEnd, planRelist, planRevise, reviseSnapshot, reviseSteps } from '../lib/changes.mjs';
+import { parseItemDetail, parseSellingList, sellingRequest } from '../lib/manage.mjs';
 import { AuthError, createTokenProvider, defaultKeysFile, LISTING_SCOPES } from '../lib/oauth.mjs';
 import { CONDITIONS, parseResults, readSearchPage, searchUrl, SORTS } from '../lib/search.mjs';
 import { ShopConfigError, parseShops, resolveShop } from '../lib/shops.mjs';
@@ -114,6 +116,7 @@ function precheck(a) {
     if (k.length > 200) throw new QueryError('keyword 最多 200 个字符');
   }
   if (a.query !== undefined && !a.query.trim()) throw new QueryError('query 不能为空');
+  if (a.item_id !== undefined && !/^\d{9,15}$/.test(a.item_id)) throw new QueryError('item_id 应是 eBay 的 ItemID（9~15 位数字，ebay_listings 查）');
   if (a.query !== undefined && a.query.length > 350) throw new QueryError('query 最多 350 个字符');
   if (a.category_id !== undefined && !/^\d{1,12}$/.test(a.category_id)) throw new QueryError('category_id 应是数字类目 ID（用 ebay_research_categories 查）');
   for (const k of ['price_min', 'price_max']) if (a[k] !== undefined && !(Number.isFinite(a[k]) && a[k] >= 0)) throw new QueryError(`${k} 应是不小于 0 的数字（美元）`);
@@ -252,7 +255,7 @@ function loadDefaults(shop) {
       return: (r.returnPolicies ?? []).map((x) => ({ id: String(x.returnPolicyId), name: x.name, returns_accepted: x.returnsAccepted === true, period_days: x.returnPeriod?.value ?? null, paid_by: x.returnShippingCostPayer ?? null })),
       payment: (p.paymentPolicies ?? []).map((x) => ({ id: String(x.paymentPolicyId), name: x.name, immediate_pay: x.immediatePay === true })),
     };
-    const sell = failIf(await tradingCall({ token, call: 'GetMyeBaySelling', body: '<ActiveList><Include>true</Include><Sort>StartTimeDescending</Sort><Pagination><EntriesPerPage>5</EntriesPerPage><PageNumber>1</PageNumber></Pagination></ActiveList>' }), '读在售 listing ');
+    const sell = failIf(await tradingCall({ token, call: 'GetMyeBaySelling', body: sellingRequest({ status: 'active', pageSize: 5, sort: 'StartTimeDescending' }) }), '读在售 listing ');
     const items = [];
     for (const id of activeItemIds(sell.xml).slice(0, 3)) {
       const g = await tradingCall({ token, call: 'GetItem', body: `<ItemID>${id}</ItemID><DetailLevel>ReturnAll</DetailLevel>` });
@@ -261,6 +264,31 @@ function loadDefaults(shop) {
     return { shop: shop.name, ebay_user_id: tokens.grantInfo(shop.storeId).ebay_user_id, policies, defaults: pickDefaults(items), recent_categories: [...new Set(items.map((x) => x.category_id).filter(Boolean))] };
   }));
 }
+
+const listings = async (a) => {
+  const shop = shopFor(a.shop);
+  const status = a.status ?? 'active';
+  const page = a.page ?? 1;
+  return withUserToken(shop, async (token) => {
+    const r = failIf(await tradingCall({ token, call: 'GetMyeBaySelling', body: sellingRequest({ status, page, pageSize: a.page_size ?? 50, sort: status === 'active' ? 'StartTimeDescending' : undefined }) }), '读 listing 列表');
+    const out = parseSellingList(r.xml, status);
+    return { shop: shop.name, status, page, ...out,
+      note: `${status === 'active' ? '在售' : '已结束未售出（可重新上架）'}的 listing，按上架时间从新到旧。price 是单价（多规格时是最低价，price_max 是最高价），quantity_available 可售数量，`
+        + 'quantity_sold 已售件数，watchers 关注人数，variations 规格数。改某一条先用 ebay_listing_get 看详情。' };
+  });
+};
+
+const listingGet = async (a) => {
+  const shop = shopFor(a.shop);
+  return withUserToken(shop, async (token) => {
+    const r = failIf(await tradingCall({ token, call: 'GetItem', body: `<ItemID>${a.item_id}</ItemID><DetailLevel>ReturnAll</DetailLevel><IncludeItemSpecifics>true</IncludeItemSpecifics>` }), '读 listing ');
+    const d = parseItemDetail(r.xml);
+    const { description, ...rest } = d;
+    const full = a.include_description === true;
+    return { shop: shop.name, ...rest, description: full ? description : description.slice(0, 1500), description_chars: description.length, description_truncated: !full && description.length > 1500,
+      note: 'quantity_available = 可售数量（总数减已售）；多规格的价格、数量在 variations.items 里。改这条 listing 用 ebay_listing_revise_preview；要完整描述传 include_description=true。' };
+  });
+};
 
 const listingDefaults = async (a) => {
   const out = await loadDefaults(shopFor(a.shop));
@@ -376,12 +404,93 @@ const listingPublish = async (a) => {
     ...(r.xml ? { fees: parseFees(r.xml), warnings: r.warnings } : {}), note };
 };
 
+// ---- 修改已有 listing：预检（算出改前 → 改后，存成修改记录）→ 用户确认 → ebay_listing_apply ----
+const fetchItem = async (token, itemId) => parseItemDetail(failIf(await tradingCall({ token, call: 'GetItem', body: `<ItemID>${itemId}</ItemID><DetailLevel>ReturnAll</DetailLevel><IncludeItemSpecifics>true</IncludeItemSpecifics>` }), '读 listing ').xml);
+
+const changeOut = (shop, rec, d) => ({
+  shop: shop.name, change_id: rec.id, kind: rec.kind, item: { item_id: d.item_id, title: d.title, url: d.url }, changes: rec.changes, notes: rec.notes, steps: rec.steps.length,
+  note: '还没有修改 eBay 上的 listing。把 changes（改前 → 改后）和 notes 给用户核对；用户明确同意后，用 change_id 调 ebay_listing_apply（confirm=true）执行。24 小时内有效；要调整就重新预检。',
+});
+
+const saveChange = (shop, kind, d, extra) => previews.save({ id: newPreviewId(), kind, store_id: shop.storeId, item_id: d.item_id, created_at: new Date().toISOString(), status: 'ready', ...extra });
+
+const revisePreview = async (a) => {
+  const shop = shopFor(a.shop);
+  const { shop: _s, item_id: itemId, ...input } = a;
+  return withUserToken(shop, async (token) => {
+    const d = await fetchItem(token, itemId);
+    const plan = planRevise(input, d);
+    if (plan.intent.policies) {
+      const known = (await loadDefaults(shop)).policies;
+      for (const [k, id] of Object.entries(plan.intent.policies)) {
+        if (!known[k].some((p) => p.id === id)) throw new ListingError(`${{ fulfillment: '运费', return: '退货', payment: '付款' }[k]}政策 ${id} 不是这家店的（用 ebay_listing_defaults 查）`);
+      }
+    }
+    const pictures = plan.newImages.length ? await uploadImages(token)(plan.newImages) : new Map();
+    const snapshot = reviseSnapshot(plan.intent, d, pictures);
+    const steps = reviseSteps(buildReviseXml(d.item_id, plan.intent, d, pictures), snapshot);
+    const rec = saveChange(shop, 'revise', d, { steps, intent: plan.intent, snapshot, changes: plan.changes, notes: plan.notes, title: d.title });
+    return changeOut(shop, rec, d);
+  }, { listing: true });
+};
+
+const endPreview = async (a) => {
+  const shop = shopFor(a.shop);
+  return withUserToken(shop, async (token) => {
+    const d = await fetchItem(token, a.item_id);
+    const plan = planEnd(d, a.reason ?? 'NotAvailable');
+    const rec = saveChange(shop, 'end', d, { steps: plan.steps, snapshot: plan.snapshot, changes: plan.changes, notes: plan.notes, title: d.title });
+    return changeOut(shop, rec, d);
+  }, { listing: true });
+};
+
+const relistPreview = async (a) => {
+  const shop = shopFor(a.shop);
+  return withUserToken(shop, async (token) => {
+    const d = await fetchItem(token, a.item_id);
+    const plan = planRelist(d, newUuid());
+    const summary = { images: d.images.length, category: d.category, policies: Object.fromEntries(Object.entries(d.policies).map(([k, v]) => [k, v?.name ?? null])) };
+    const rec = saveChange(shop, 'relist', d, { steps: plan.steps, snapshot: plan.snapshot, changes: [...plan.changes, { field: '沿用原 listing', before: null, after: summary }], notes: plan.notes, title: d.title });
+    return changeOut(shop, rec, d);
+  }, { listing: true });
+};
+
+const listingApply = async (a) => {
+  const shop = shopFor(a.shop);
+  if (a.confirm !== true) throw new QueryError('confirm 要传 true：执行前必须把 changes（改前 → 改后）给用户看过并得到明确同意');
+  previews.load(a.change_id);
+  // 按 listing 加锁：同一条 listing 的不同修改也排队，不会读到同一份旧状态后互相覆盖
+  const lockItem = (itemId, fn) => withLock(DATA_DIR, fn, { key: `item:${shop.storeId}:${itemId}`, what: '这条 listing 的修改', waitMs: 5000, owner: `ebay-seller-mcp ${process.pid}` }).catch((err) => {
+    if (err instanceof LockBusyError) throw new ListingError('这条 listing 正在被另一个任务修改，等它结束后再用同一个 change_id 调 ebay_listing_apply，不要重新预检。');
+    throw err;
+  });
+  const r = await withUserToken(shop, (token) => applyChange({
+    previews, id: a.change_id, storeId: shop.storeId, describe, lockItem,
+    getItem: (itemId) => fetchItem(token, itemId),
+    call: (step) => tradingCall({ token, call: step.call, body: step.body, timeoutMs: 180_000 }),
+  }), { listing: true });
+  const item = { item_id: r.rec.item_id, title: r.rec.title, url: `https://www.ebay.com/itm/${r.rec.item_id}` };
+  if (!r.ok) {
+    return { shop: shop.name, ok: false, item, errors: r.errors, warnings: r.warnings,
+      note: r.partial
+        ? 'eBay 报错了，但这条修改之前已经部分生效或结果不确定：先用 ebay_listing_get 看现在的样子，再决定用同一个 change_id 重试（会先对账），还是重新预检。'
+        : 'eBay 拒绝了这次修改（没有生效）：按 errors 调整后重新预检。' };
+  }
+  const result = r.result ?? {};
+  const note = r.already_applied ? '这条修改之前已经执行过了，没有重复执行。'
+    : result.new_item_id ? `已重新上架，新 ItemID ${result.new_item_id}。` : result.already_ended ? '这条 listing 已经是结束状态。' : result.ended ? '已下架。' : '已生效。';
+  return { shop: shop.name, ok: true, kind: r.rec.kind, item, ...(result.new_item_id ? { new_item_id: result.new_item_id, new_url: `https://www.ebay.com/itm/${result.new_item_id}` } : {}),
+    changes: r.rec.changes, warnings: r.warnings ?? [], note };
+};
+
 const INSTRUCTIONS = 'eBay 市场调研（通过本机紫鸟店铺浏览器里已登录的 eBay Seller Hub 取数，只读）。'
   + 'Terapeak（已售成交，最多 3 年）：ebay_research（成交均价、成交件数、售罄率、卖家数、成交总额 + 按成交件数排的 listing）、ebay_research_trend（每天 / 周 / 月的成交均价和件数）、'
   + 'ebay_research_categories（各类目成交件数，可往下钻）、ebay_research_active（在售 listing 数、均价、推广占比 + 在售 listing）。'
   + '前台：ebay_search（买家看到的搜索结果：排名、价格、运费、发货地、已售件数）。金额美元，eBay 美国站。'
   + '刊登（eBay 开放平台）：先 ebay_listing_defaults（店里的政策和发货地）、ebay_category_suggest（找类目）、ebay_category_aspects（类目必填属性和能用的商品状态），'
-  + '再 ebay_listing_preview（eBay 只校验不刊登，返回 preview_id、费用和摘要），把摘要给用户确认后才能 ebay_listing_publish(preview_id, confirm=true) 正式刊登。';
+  + '再 ebay_listing_preview（eBay 只校验不刊登，返回 preview_id、费用和摘要），把摘要给用户确认后才能 ebay_listing_publish(preview_id, confirm=true) 正式刊登。'
+  + '已有 listing：ebay_listings / ebay_listing_get 查；改内容、改价改库存、增删规格用 ebay_listing_revise_preview，下架用 ebay_listing_end_preview，重新上架用 ebay_listing_relist_preview，'
+  + '都只生成「改前 → 改后」的修改记录，用户确认后才能 ebay_listing_apply(change_id, confirm=true) 执行。';
 
 // ---- 工具定义 ----
 const shopArg = { type: 'string', description: '店铺名或紫鸟店铺 ID；不填 = 默认店（见 ebay_shops）' };
@@ -444,6 +553,29 @@ const TOOLS = [
     run: search,
   },
   {
+    name: 'ebay_listings',
+    description: '自家店铺的 listing 列表：在售（active）或已结束未售出（unsold，可重新上架）。每条的 ItemID、标题、SKU、价格（多规格的价格区间）、可售数量、已售件数、关注人数、规格数。',
+    annotations: LISTING_RO,
+    inputSchema: obj({
+      shop: shopArg,
+      status: { type: 'string', enum: ['active', 'unsold'], default: 'active', description: 'active 在售 / unsold 已结束未售出' },
+      page: { type: 'integer', minimum: 1, maximum: 100, default: 1 },
+      page_size: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+    }),
+    run: listings,
+  },
+  {
+    name: 'ebay_listing_get',
+    description: '一条 listing 的详情：标题、类目、状态、价格和可售数量（多规格逐个规格）、已售件数、图片、商品属性、规格配图、运费 / 退货 / 付款政策、发货地、描述。改 listing 前先看。',
+    annotations: LISTING_RO,
+    inputSchema: obj({
+      shop: shopArg,
+      item_id: { type: 'string', description: 'eBay ItemID（ebay_listings 查）' },
+      include_description: { type: 'boolean', description: 'true = 返回完整描述（默认只给前 1500 个字符）' },
+    }, ['item_id']),
+    run: listingGet,
+  },
+  {
     name: 'ebay_listing_defaults',
     description: '刊登前先看：这家店的运费 / 退货 / 付款政策（ID、名称、运费方式），以及最近在售商品常用的发货地和政策组合（预检不传 policies / location 时用它）、最近用过的类目。',
     annotations: LISTING_RO,
@@ -503,6 +635,65 @@ const TOOLS = [
       confirm: { type: 'boolean', description: '用户已经看过预检摘要并明确同意刊登时传 true' },
     }, ['preview_id', 'confirm']),
     run: listingPublish,
+  },
+  {
+    name: 'ebay_listing_revise_preview',
+    description: '修改在售 listing 的预检（不会改 eBay 上的东西）：对比当前 listing 算出「改前 → 改后」，存成修改记录，返回 change_id。只传要改的项：'
+      + '标题、描述、图片（完整新列表，整组替换）、商品属性（完整新属性，整组替换）、商品状态、类目、政策、发货地、议价、单规格的价格 / 可售数量，多规格用 variations 按 SKU 改价改量、新增或删除规格。'
+      + '已有销量的 listing，eBay 不允许改标题、类目、发货地。',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    inputSchema: obj({
+      shop: shopArg,
+      item_id: { type: 'string', description: '要改的 ItemID' },
+      title: { type: 'string', description: '新标题（≤80 个字符）' },
+      description: { type: 'string', description: '新描述（HTML 或纯文本，整段替换）' },
+      images: { type: 'array', items: { type: 'string' }, description: '改后的完整图片列表（第一张是主图）：原来的 eBay 图片地址保留不动，新图传本地绝对路径或 https 网址' },
+      aspects: { type: 'object', description: '改后的完整商品属性（整组替换，没写的属性会被删掉）：先用 ebay_listing_get 拿到现在的属性再改' },
+      condition_id: { type: 'integer', description: '新的商品状态 ID' },
+      condition_description: { type: 'string', description: '商品状态说明' },
+      category_id: { type: 'string', description: '新的叶子类目 ID（没有销量时才能改）' },
+      policies: { type: 'object', description: '要换的政策：{ fulfillment_policy_id?, return_policy_id?, payment_policy_id? }（ebay_listing_defaults 查）' },
+      location: { type: 'object', description: '新发货地（整组）：{ country, location, postal_code }（没有销量时才能改）' },
+      best_offer: { type: 'boolean', description: '单规格：是否接受议价' },
+      price: { type: 'number', description: '单规格：新价格（美元）' },
+      quantity: { type: 'integer', description: '单规格：新的可售数量（不含已卖出的）' },
+      variations: {
+        type: 'object',
+        description: '多规格：{ "update": [{ "sku": "A-1", "price": 12.99, "quantity": 30 }], "add": [{ "sku": "A-9", "price": 12.99, "quantity": 20, "values": {"Size": "XL", "Color": "Red"}, "image": "/path/red.jpg" }], "remove": ["A-3"] }。'
+          + 'update 按 SKU 改价格 / 可售数量；add 新增规格（values 要包含所有规格名）；remove 删除规格（按 SKU）。',
+      },
+    }, ['item_id']),
+    run: revisePreview,
+  },
+  {
+    name: 'ebay_listing_end_preview',
+    description: '下架（结束在售 listing）的预检：不会改 eBay 上的东西，返回 change_id 和要下架的 listing 信息。下架后只能用重新上架恢复，会变成新 ItemID。',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    inputSchema: obj({
+      shop: shopArg,
+      item_id: { type: 'string', description: '要下架的 ItemID' },
+      reason: { type: 'string', enum: Object.keys(END_REASONS), default: 'NotAvailable', description: Object.entries(END_REASONS).map(([k, v]) => `${k} ${v}`).join(' / ') },
+    }, ['item_id']),
+    run: endPreview,
+  },
+  {
+    name: 'ebay_listing_relist_preview',
+    description: '重新上架的预检：对已结束的 listing（ebay_listings status=unsold 查，90 天内）按原样重新刊登。不会改 eBay 上的东西，返回 change_id；执行后是新的 ItemID，可能产生刊登费。',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    inputSchema: obj({ shop: shopArg, item_id: { type: 'string', description: '已结束 listing 的 ItemID' } }, ['item_id']),
+    run: relistPreview,
+  },
+  {
+    name: 'ebay_listing_apply',
+    description: '执行修改 / 下架 / 重新上架（会改 eBay 上的 listing）：只能执行 ebay_listing_revise_preview / end_preview / relist_preview 生成的修改记录（按 change_id，内容不能再改）。'
+      + '必须先把 changes（改前 → 改后）给用户看、用户明确同意后才能调用，confirm 传 true。执行前会重新读 listing，预检后被改过就拒绝；同一个 change_id 重复调用不会重复执行。',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    inputSchema: obj({
+      shop: shopArg,
+      change_id: { type: 'string', description: '预检返回的 change_id' },
+      confirm: { type: 'boolean', description: '用户已经看过改动并明确同意时传 true' },
+    }, ['change_id', 'confirm']),
+    run: listingApply,
   },
 ];
 const BY_NAME = new Map(TOOLS.map((t) => [t.name, t]));

@@ -1,12 +1,13 @@
 # ebay-seller-mcp
 
-eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国站的真实成交均价、成交件数、售罄率、卖家数、成交总额、热卖 listing、每日 / 周 / 月走势、类目分布、在售竞争）、**eBay 前台搜索**（买家看到的排名、价格、运费、发货地、已售件数），和**刊登**（预检 → 用户确认后发布，支持多规格）。
+eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国站的真实成交均价、成交件数、售罄率、卖家数、成交总额、热卖 listing、每日 / 周 / 月走势、类目分布、在售竞争）、**eBay 前台搜索**（买家看到的排名、价格、运费、发货地、已售件数），和**刊登与管理**（新刊登、改内容 / 改价改库存 / 增删规格、下架、重新上架：都是预检 → 用户确认后执行）。
 
 调研和搜索从**本机紫鸟（Ziniao）店铺浏览器里已登录的 eBay Seller Hub** 取：Terapeak 用 Seller Hub Research 页面自己的接口，前台搜索在一个专用标签页里真实打开搜索页再读页面，不需要 App Key，请求走那家店的紫鸟代理 IP。
 刊登走 **eBay 开放平台**（需要自己的开发者密钥和店铺授权，见「刊登」）。
 
 - **调研只读**：调研和搜索工具不改 listing、不改价、不发消息。
-- **刊登两步走**：`ebay_listing_preview` 只让 eBay 校验、不刊登；`ebay_listing_publish` 只能发布预检通过的原样内容，并且要 `confirm: true`（客户端应先把预检摘要给用户确认）。不改已有 listing、不改价、不下架。
+- **写操作都两步走**：新刊登 `ebay_listing_preview` 只让 eBay 校验、不刊登，`ebay_listing_publish` 只能发布预检通过的原样内容；
+  改已有 listing / 下架 / 重新上架的 `*_preview` 只生成「改前 → 改后」的修改记录，`ebay_listing_apply` 才执行。执行都要 `confirm: true`（客户端应先把预检结果给用户确认）。
 - **遇到验证就停**：eBay 浏览器检查页（Pardon Our Interruption）一直不放行、验证码、请求太频繁、请求被转到验证 / 登录页时，不重试，并且这家店 10 分钟内不再发请求（记在数据目录的 `cooldown.json`，用同一个数据目录的其他 MCP 进程也会停；删掉它可立即恢复）。
 - **少发请求**：每个工具一次调用只发 1 个请求（前台搜索是打开 1 个页面）；相同查询 Terapeak 30 分钟、前台搜索 10 分钟内直接用缓存。
 - 零依赖，Node.js ≥ 22。
@@ -58,6 +59,12 @@ eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国
 | `ebay_category_aspects` | 刊登：类目的商品属性（必填 / 建议 / 可选、可选值、能否做规格名）、能用的商品状态、能否多规格 |
 | `ebay_listing_preview` | 刊登预检（不刊登）：上传图片到 eBay 图片服务，让 eBay 按真实规则校验，返回错误 / 警告、刊登费用、内容摘要和 `preview_id`（24 小时有效） |
 | `ebay_listing_publish` | 正式刊登：按 `preview_id` 发布预检通过的原样内容（`confirm: true`）；同一个 `preview_id` 重复调用不会重复刊登 |
+| `ebay_listings` | 自家 listing 列表：在售 / 已结束未售出（ItemID、标题、SKU、价格区间、可售数量、已售件数、关注人数、规格数） |
+| `ebay_listing_get` | 一条 listing 的详情：标题、类目、价格和可售数量（逐个规格）、图片、属性、规格配图、政策、发货地、描述 |
+| `ebay_listing_revise_preview` | 修改预检：改标题 / 描述 / 图片 / 属性 / 状态 / 类目 / 政策 / 发货地 / 议价、改价改库存、按 SKU 增删规格，返回「改前 → 改后」和 `change_id` |
+| `ebay_listing_end_preview` | 下架预检（返回 `change_id`） |
+| `ebay_listing_relist_preview` | 重新上架预检：已结束 90 天内的 listing 按原样重新刊登（返回 `change_id`） |
+| `ebay_listing_apply` | 执行修改 / 下架 / 重新上架（`confirm: true`）：执行前重新读 listing，预检后被改过就拒绝；同一个 `change_id` 不会重复执行 |
 
 ## 口径
 
@@ -87,6 +94,9 @@ eBay 卖家 MCP 服务器：**Terapeak 商品调研**（关键词在 eBay 美国
 
 刊登口径：一口价、GTC 长期在售、美元、eBay 美国站；运费 / 退货 / 付款用店里已有的业务政策（不传就用最近在售商品最常用的组合）；
 图片上传后 eBay 保留约 30 天，同一张图在有效期内不重复上传；预检记录 24 小时内可发布。发布带 UUID，网络中断后用同一个 `preview_id` 重发，eBay 会认出已刊登的商品而不会重复刊登。
+
+修改口径：改价改库存用 ReviseInventoryStatus（数量是可售数量，不含已卖出的），其余用 ReviseFixedPriceItem（图片、商品属性整组替换）；规格要有 SKU 才能单独改。
+已有销量（或 12 小时内到期）的 listing，eBay 不允许改标题、类目、发货地。下架后只能重新上架（新 ItemID）；重新上架带 UUID 防重复。
 
 ## 说明
 
