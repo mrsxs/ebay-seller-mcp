@@ -66,8 +66,8 @@ test('ads: TSV report parsing and totals', () => {
   const { columns, rows } = parseReportTsv(tsv);
   assert.deepEqual(rows[0], { day: '2026-10-16', impressions: 10503, clicks: 7, ctr: 0.0007, sales: 1, sale_amount: { value: 17.01, currency: 'USD' }, ad_fees: { value: 2.55, currency: 'USD' } });
   assert.deepEqual(reportTotals(rows, columns), { impressions: 18833, clicks: 14, sales: 2, sale_amount: { value: 36.08, currency: 'USD' }, ad_fees: { value: 4.65, currency: 'USD' } });
-  const ids = parseReportTsv('listing_id\tcampaign_id\timpressions\n012345678901\t148387216018\t5\n').rows[0];
-  assert.deepEqual([ids.listing_id, ids.campaign_id], ['012345678901', '148387216018'], 'ID columns stay strings');
+  const ids = parseReportTsv('listing_id\tcampaign_id\timpressions\n012345678901\t900000000018\t5\n').rows[0];
+  assert.deepEqual([ids.listing_id, ids.campaign_id], ['012345678901', '900000000018'], 'ID columns stay strings');
   assert.equal(cellValue('USD 1,234.50').value, 1234.5);
   assert.equal(cellValue(''), null);
 });
