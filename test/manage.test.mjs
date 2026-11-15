@@ -29,7 +29,7 @@ test('parseSellingList: single and multi-variation rows', () => {
 });
 
 test('parseItemDetail: variations, pictures, policies; seller block ignored; quantity = total − sold', () => {
-  const xml = `<GetItemResponse><Item><ItemID>227612275584</ItemID><Title>Diorama Base</Title><Country>CN</Country><Location>Shenzhen</Location>
+  const xml = `<GetItemResponse><Item><ItemID>123456789012</ItemID><Title>Diorama Base</Title><Country>CN</Country><Location>Shenzhen</Location>
     <PrimaryCategory><CategoryID>262323</CategoryID><CategoryName>Toys &amp; Hobbies:Dioramas</CategoryName></PrimaryCategory><ConditionID>1000</ConditionID><ConditionDisplayName>New</ConditionDisplayName>
     <Seller><UserID>someone</UserID><Site>HongKong</Site></Seller>
     <SellingStatus><QuantitySold>7</QuantitySold><ListingStatus>Active</ListingStatus></SellingStatus>
