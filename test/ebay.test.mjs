@@ -201,11 +201,13 @@ test('MCP：握手、工具列表、参数错误在连浏览器之前返回', as
     assert.equal(init.result.serverInfo.name, 'ebay-seller-mcp');
     const tools = (await rpc('tools/list', {})).result.tools;
     assert.deepEqual(tools.map((t) => t.name), ['ebay_shops', 'ebay_research', 'ebay_research_trend', 'ebay_research_categories', 'ebay_research_active', 'ebay_search',
-      'ebay_orders', 'ebay_traffic', 'ebay_seller_standards', 'ebay_listings', 'ebay_listing_get', 'ebay_listing_defaults', 'ebay_category_suggest', 'ebay_category_aspects', 'ebay_listing_preview', 'ebay_listing_publish',
+      'ebay_orders', 'ebay_traffic', 'ebay_seller_standards', 'ebay_finance_summary', 'ebay_transactions', 'ebay_payouts', 'ebay_ad_campaigns', 'ebay_ad_campaign_ads', 'ebay_ad_report', 'ebay_ad_change_preview', 'ebay_ad_change_apply', 'ebay_listings', 'ebay_listing_get', 'ebay_listing_defaults', 'ebay_category_suggest', 'ebay_category_aspects', 'ebay_listing_preview', 'ebay_listing_publish',
       'ebay_listing_revise_preview', 'ebay_listing_end_preview', 'ebay_listing_relist_preview', 'ebay_listing_apply']);
     // 只有预检（上传图片 / 存修改记录）、发布和执行修改不是只读
     assert.deepEqual(tools.filter((t) => t.annotations.readOnlyHint !== true).map((t) => t.name),
-      ['ebay_listing_preview', 'ebay_listing_publish', 'ebay_listing_revise_preview', 'ebay_listing_end_preview', 'ebay_listing_relist_preview', 'ebay_listing_apply']);
+      ['ebay_ad_change_preview', 'ebay_ad_change_apply', 'ebay_listing_preview', 'ebay_listing_publish', 'ebay_listing_revise_preview', 'ebay_listing_end_preview', 'ebay_listing_relist_preview', 'ebay_listing_apply']);
+    assert.match(await text('ebay_ad_change_apply', { change_id: '0123456789abcdef', confirm: false }), /confirm 要传 true/);
+    assert.match(await text('ebay_ad_campaign_ads', { campaign_id: 'x1' }), /campaign_id 应是数字/);
     assert.match(await text('ebay_listing_apply', { change_id: '0123456789abcdef', confirm: false }), /confirm 要传 true/);
     assert.match(await text('ebay_listing_get', { item_id: 'abc' }), /item_id 应是 eBay 的 ItemID/);
     assert.match(await text('ebay_listing_publish', { preview_id: '0123456789abcdef', confirm: false }), /confirm 要传 true/);

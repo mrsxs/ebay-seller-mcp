@@ -6,12 +6,13 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { authorizeStore } from '../lib/auth-flow.mjs';
 import { LockBusyError, withBrowserLock, withLock } from '../lib/browser-lock.mjs';
 import { createBrowserSession, EBAY_SITE, navigateAndWait, PageBlockedError, SEARCH_SITE } from '../lib/browser.mjs';
 import { CooldownError, createCooldown, isVerifyMessage } from '../lib/cooldown.mjs';
-import { ApiError, describe, parseFees, restCall, TokenRejectedError, tradingCall, uploadImage } from '../lib/ebay-api.mjs';
+import { ApiError, describe, FINANCES_BASE, parseFees, restCall, TokenRejectedError, tradingCall, uploadImage } from '../lib/ebay-api.mjs';
 import { createTerapeakApi, EbayError } from '../lib/ebay.mjs';
 import {
   activeItemIds, allImages, applyDefaults, buildItemXml, createImageUploader, createPreviewStore, ListingError, listingSummary, newPreviewId,
@@ -20,7 +21,10 @@ import {
 import { applyChange, buildReviseXml, END_REASONS, planEnd, planRelist, planRevise, reviseSnapshot, reviseSteps } from '../lib/changes.mjs';
 import { parseItemDetail, parseSellingList, sellingRequest } from '../lib/manage.mjs';
 import { ORDER_STATUS, orderErrorMessage, ordersPath, parseOrder, parseStandards, parseTraffic, summarizeOrders, TRAFFIC_DAYS, trafficPath, trafficRange } from '../lib/store.mjs';
-import { AuthError, createTokenProvider, defaultKeysFile, LISTING_SCOPES } from '../lib/oauth.mjs';
+import { AD_ACTIONS, applyAdChange, campaignSnapshot, loadAllAds, planAdChange } from '../lib/adchanges.mjs';
+import { AD_DAYS, adsPath, CAMPAIGN_STATUS, campaignsPath, createReportStore, parseAd, parseCampaign, parseReportTsv, REPORTS, reportBody, reportRange, reportText, reportTotals } from '../lib/ads.mjs';
+import { FIN_DAYS, mergeTransactionSummaries, parseFunds, parsePayout, parseTransaction, payoutsPath, sinceIso, summarizeTransactions, transactionsPath, TX_STATUSES, TX_TYPES } from '../lib/finance.mjs';
+import { AuthError, createTokenProvider, defaultKeysFile, LISTING_SCOPES, MARKETING_SCOPES, READ_SCOPES } from '../lib/oauth.mjs';
 import { CONDITIONS, parseResults, readSearchPage, searchUrl, SORTS } from '../lib/search.mjs';
 import { ShopConfigError, parseShops, resolveShop } from '../lib/shops.mjs';
 import {
@@ -117,6 +121,7 @@ function precheck(a) {
     if (k.length > 200) throw new QueryError('keyword 最多 200 个字符');
   }
   if (a.query !== undefined && !a.query.trim()) throw new QueryError('query 不能为空');
+  if (a.campaign_id !== undefined && !/^\d{1,20}$/.test(a.campaign_id)) throw new QueryError('campaign_id 应是数字活动 ID（ebay_ad_campaigns 查）');
   if (a.item_id !== undefined && !/^\d{9,15}$/.test(a.item_id)) throw new QueryError('item_id 应是 eBay 的 ItemID（9~15 位数字，ebay_listings 查）');
   if (a.query !== undefined && a.query.length > 350) throw new QueryError('query 最多 350 个字符');
   if (a.category_id !== undefined && !/^\d{1,12}$/.test(a.category_id)) throw new QueryError('category_id 应是数字类目 ID（用 ebay_research_categories 查）');
@@ -210,11 +215,13 @@ const shops = () => {
 const KEYS_FILE = defaultKeysFile();
 const tokens = createTokenProvider({ file: KEYS_FILE });
 const previews = createPreviewStore({ dir: DATA_DIR });
+const reports = createReportStore({ dir: DATA_DIR });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const AUTH_HINT = (storeId) => `npx -y ebay-seller-mcp@latest auth --store-id ${storeId}`;
 
 /** 用这家店的用户令牌调接口；令牌被拒（401 / 授权错误）时换一次新令牌再试（被拒的请求不会生效） */
-async function withUserToken(shop, fn, { listing = false } = {}) {
-  const get = () => tokens.userToken(shop.storeId, listing ? { needScopes: LISTING_SCOPES } : {});
+async function withUserToken(shop, fn, { listing = false, needScopes = null } = {}) {
+  const get = () => tokens.userToken(shop.storeId, { needScopes: [...(listing ? LISTING_SCOPES : []), ...(needScopes ?? [])] });
   try {
     return await fn(await get());
   } catch (err) {
@@ -472,6 +479,198 @@ const sellerStandards = async (a) => {
   })));
 };
 
+// ---- 财务（Finances API，只读）----
+const finGet = (token, path) => restCall({ token, path, base: FINANCES_BASE });
+
+const financeSummary = async (a) => {
+  const shop = shopFor(a.shop);
+  const days = a.days ?? 30;
+  return cachedResult('api', `${shop.storeId}|finsum|${days}`, () => withUserToken(shop, async (token) => {
+    const funds = parseFunds(await finGet(token, '/sell/finances/v1/seller_funds_summary'));
+    const since = sinceIso(days);
+    const sums = [];
+    for (const st of TX_STATUSES) sums.push(await finGet(token, `/sell/finances/v1/transaction_summary?${new URLSearchParams({ filter: `transactionDate:[${since}..],transactionStatus:{${st}}` })}`));
+    const ps = await finGet(token, `/sell/finances/v1/payout_summary?${new URLSearchParams({ filter: `payoutDate:[${since}..]` })}`);
+    return {
+      shop: shop.name, days, funds, period: mergeTransactionSummaries(sums),
+      payouts: { count: ps.payoutCount ?? 0, transactions: ps.transactionCount ?? 0, amount: ps.amount ? { value: Number(ps.amount.value), currency: ps.amount.currency } : null },
+      note: 'funds 是现在的资金：total 总额、available 可提现（可能是负数）、processing 处理中、on_hold 冻结。period 是最近 N 天各类交易：count 笔数，credit 入账金额、debit 扣款金额、net = 入账 − 扣款。'
+        + 'credits 是入账类（销售为主，也含卖家补偿等其他入账，不完全等于销售额；只看销售用 ebay_transactions type=SALE）、refunds 退款、non_sale_charges 非销售扣费（广告费、店铺订阅等）、'
+        + 'shipping_labels 运单、disputes 纠纷、on_hold 冻结中。payouts 是这段时间的回款。费用明细用 ebay_transactions。',
+    };
+  }));
+};
+
+const transactions = async (a) => {
+  const shop = shopFor(a.shop);
+  const pageSize = a.page_size ?? 50;
+  const page = a.page ?? 1;
+  return withUserToken(shop, async (token) => {
+    const j = await finGet(token, transactionsPath({ days: a.days ?? 30, type: a.type, limit: pageSize, offset: (page - 1) * pageSize }));
+    const list = (j.transactions ?? []).map(parseTransaction);
+    return { shop: shop.name, days: a.days ?? 30, type: a.type ?? 'all', page, total: j.total ?? list.length, transactions: list, summary: summarizeTransactions(list),
+      note: '每笔资金交易（eBay 美国站，时间 UTC）：type 是 SALE 销售 / REFUND 退款 / NON_SALE_CHARGE 非销售扣费（fee_type 说明是什么费，如广告费、店铺订阅）/ SHIPPING_LABEL 运单 / DISPUTE 纠纷 等；'
+        + 'booking 是 CREDIT 入账 / DEBIT 扣款；status 是资金状态（PAYOUT 已回款、FUNDS_ON_HOLD 冻结…）。销售的 fees 是这笔订单被扣的各项费用（FINAL_VALUE_FEE 成交费、INTERNATIONAL_FEE 国际费、广告费等）。'
+        + 'summary 只统计这一页。不返回买家信息。' };
+  });
+};
+
+const payouts = async (a) => {
+  const shop = shopFor(a.shop);
+  const pageSize = a.page_size ?? 50;
+  const page = a.page ?? 1;
+  return withUserToken(shop, async (token) => {
+    const j = await finGet(token, payoutsPath({ days: a.days ?? 90, limit: pageSize, offset: (page - 1) * pageSize }));
+    return { shop: shop.name, days: a.days ?? 90, page, total: j.total ?? 0, payouts: (j.payouts ?? []).map(parsePayout),
+      note: '回款记录：status 是 SUCCEEDED 已到账 / INITIATED 已发起 / RETRYABLE_FAILED 失败待重试 等；converted 是换汇后的金额和汇率；fee 是回款手续费。不返回银行卡信息。' };
+  });
+};
+
+// ---- 广告（Marketing API）----
+const campaignList = (shop, token, status = 'all') => cachedResult('api', `${shop.storeId}|campaigns|${status}`, async () => {
+  const campaigns = [];
+  for (let offset = 0; offset < 5000; offset += 200) {
+    const j = await restCall({ token, path: campaignsPath(status, offset) });
+    campaigns.push(...(j.campaigns ?? []).map(parseCampaign));
+    if (campaigns.length >= Number(j.total ?? 0) || !(j.campaigns ?? []).length) break;
+  }
+  return { campaigns };
+});
+
+const adCampaigns = async (a) => {
+  const shop = shopFor(a.shop);
+  return withUserToken(shop, async (token) => {
+    const { campaigns } = await campaignList(shop, token, a.status ?? 'all');
+    return { shop: shop.name, status: a.status ?? 'all', campaigns,
+      note: '推广活动：funding 是 cps 按成交付费（Promoted Listings Standard，卖出才收广告费）/ cpc 按点击付费（Advanced）；ad_rate_strategy 是 FIXED 固定费率（bid_percentage）/ DYNAMIC 动态费率（dynamic_adjustment 是在 eBay 建议费率上加减的百分比和上限）；'
+        + 'daily_budget 是按点击付费的日预算。看效果用 ebay_ad_report，看活动里有哪些商品用 ebay_ad_campaign_ads。' };
+  }, { needScopes: READ_SCOPES });
+};
+
+const adCampaignAds = async (a) => {
+  const shop = shopFor(a.shop);
+  return withUserToken(shop, async (token) => {
+    const pageSize = a.page_size ?? 200;
+    const page = a.page ?? 1;
+    const j = await restCall({ token, path: adsPath(a.campaign_id, (page - 1) * pageSize, pageSize) });
+    const { titles } = await listingTitles(shop, token);
+    const ads = (j.ads ?? []).map(parseAd).map((x) => ({ ...x, title: titles[x.listing_id] ?? null }));
+    const total = Number(j.total ?? ads.length);
+    return { shop: shop.name, campaign_id: a.campaign_id, page, total, has_more: page * pageSize < total, ads,
+      note: '活动里的商品：bid_percentage 是这个商品的广告费率（成交价的百分比，按成交付费活动）；status 是广告状态。title 为空表示这个商品已经不在售。' };
+  });
+};
+
+const adReport = async (a) => {
+  const shop = shopFor(a.shop);
+  const kind = a.report ?? 'account';
+  const funding = a.funding ?? 'cps';
+  const range = reportRange(a.days ?? 30);
+  let body;
+  try {
+    body = reportBody({ kind, funding, range, campaignIds: a.campaign_id ? [a.campaign_id] : [] });
+  } catch (err) {
+    throw new QueryError(err.message);
+  }
+  const key = reports.key(shop.storeId, body);
+  return withUserToken(shop, async (token) => {
+    const rec = await withLock(DATA_DIR, async () => {
+      const hit = reports.get(key);
+      if (hit) return hit;
+      const r = await restCall({ token, method: 'POST', path: '/sell/marketing/v1/ad_report_task', body });
+      const taskId = String(r._location ?? '').split('/').pop();
+      if (!/^\d+$/.test(taskId)) throw new ApiError('eBay 没有返回报表任务编号，稍后再试');
+      const created = { task_id: taskId, created_at: Date.now() };
+      reports.set(key, created);
+      return created;
+    }, { key: 'ad-report-tasks', what: '广告报表任务记录', waitMs: 30_000, owner: `ebay-seller-mcp ${process.pid}` });
+    const base = { shop: shop.name, report: kind, label: REPORTS[kind].label, funding, from: range.from.slice(0, 10), to: range.to.slice(0, 10), campaign_id: a.campaign_id ?? null, task_id: rec.task_id };
+    for (let i = 0; i < 5; i++) {
+      const s = await restCall({ token, path: `/sell/marketing/v1/ad_report_task/${rec.task_id}` });
+      if (s.reportTaskStatus === 'FAILED') {
+        reports.drop(key);
+        throw new ApiError(`eBay 生成报表失败${s.reportTaskStatusMessage ? `：${String(s.reportTaskStatusMessage).slice(0, 200)}` : ''}，可以再调一次重新生成`);
+      }
+      if (s.reportTaskStatus === 'SUCCESS' && s.reportHref) {
+        // 报表下载地址只接受 eBay 自己的，避免把令牌发到别处
+        if (!/^https:\/\/api\.ebay\.com\/sell\/marketing\/v1\/ad_report\/\d+$/.test(s.reportHref)) throw new ApiError('eBay 返回的报表地址不对，没有下载');
+        const res = await restCall({ token, path: s.reportHref, base: '', raw: true, timeoutMs: 60_000 });
+        const buf = Buffer.from(await res.arrayBuffer());
+        let parsed;
+        try {
+          parsed = parseReportTsv(reportText(buf, gunzipSync), body.dimensions.map((d) => d.dimensionKey));
+        } catch (err) {
+          throw new ApiError(err.message);
+        }
+        const { columns, rows } = parsed;
+        const needTitles = columns.includes('listing_id');
+        const titles = needTitles ? (await listingTitles(shop, token)).titles : {};
+        const names = columns.includes('campaign_id') ? Object.fromEntries((await campaignList(shop, token)).campaigns.map((c) => [c.campaign_id, c.name])) : {};
+        const decorated = rows.map((r) => ({ ...(r.campaign_id ? { campaign_name: names[r.campaign_id] ?? null } : {}), ...(r.listing_id ? { title: titles[r.listing_id] ?? null } : {}), ...r }));
+        const limit = a.limit ?? 200;
+        return { ...base, status: 'ready', generated: s.reportTaskCompletionDate ?? null, columns, total_rows: rows.length, totals: reportTotals(rows, columns), rows: decorated.slice(0, limit),
+          note: '推广效果（eBay 美国站）：impressions 曝光、clicks 点击、ctr 点击率（比例）、sales 广告带来的成交数、sale_amount 成交额、ad_fees 广告费、avg_cost_per_sale 每单广告费；'
+            + '按点击付费的列以 cpc_ 开头（cpc_return_on_ad_spend 是 ROAS）。totals 是各行相加（比率列不加）。rows 最多返回 limit 条。' };
+      }
+      if (i < 4) await sleep(4000);
+    }
+    return { ...base, status: 'pending', created_at: new Date(rec.created_at).toISOString(),
+      note: 'eBay 还在生成这份报表（通常 1~3 分钟）。过一会儿用同样的参数再调一次 ebay_ad_report 就能拿到结果，不会重复生成。' };
+  }, { needScopes: MARKETING_SCOPES });
+};
+
+// ---- 广告管理（写）：预检 → 用户确认 → 执行 ----
+async function loadCampaign(token, campaignId) {
+  const c = parseCampaign(await restCall({ token, path: `/sell/marketing/v1/ad_campaign/${encodeURIComponent(campaignId)}` }));
+  if (c.campaign_id !== String(campaignId) || !c.status || !c.funding) throw new ApiError('eBay 返回的活动信息不完整，稍后再试');
+  // 全部读完才能做快照对比；读不全、总数不对、有重复都不改
+  const ads = c.funding === 'cps' ? await loadAllAds((offset) => restCall({ token, path: adsPath(campaignId, offset) }), parseAd) : [];
+  return { c, ads };
+}
+const forgetCampaigns = (shop) => {
+  for (const k of cache.keys()) if (k.startsWith(`api|${shop.storeId}|campaigns`)) cache.delete(k);
+};
+
+const adChangePreview = async (a) => {
+  const shop = shopFor(a.shop);
+  const { shop: _s, campaign_id: campaignId, ...input } = a;
+  return withUserToken(shop, async (token) => {
+    const { c, ads } = await loadCampaign(token, campaignId);
+    const plan = planAdChange(input, c, ads);
+    const rec = previews.save({ id: newPreviewId(), kind: 'ad', store_id: shop.storeId, campaign_id: campaignId, created_at: new Date().toISOString(), status: 'ready',
+      request: plan.request, target: plan.target, snapshot: campaignSnapshot(c, ads), changes: plan.changes, notes: plan.notes, title: c.name, action: input.action });
+    return { shop: shop.name, change_id: rec.id, campaign: { campaign_id: c.campaign_id, name: c.name, status: c.status, funding: c.funding, ad_rate_strategy: c.ad_rate_strategy },
+      action: input.action, action_label: AD_ACTIONS[input.action], changes: plan.changes, notes: plan.notes,
+      note: '还没有改 eBay 上的广告。把 changes（改前 → 改后）和 notes 给用户核对；用户明确同意后，用 change_id 调 ebay_ad_change_apply（confirm=true）执行。24 小时内有效。' };
+  }, { needScopes: MARKETING_SCOPES });
+};
+
+const adChangeApply = async (a) => {
+  const shop = shopFor(a.shop);
+  if (a.confirm !== true) throw new QueryError('confirm 要传 true：执行前必须把 changes（改前 → 改后）给用户看过并得到明确同意');
+  previews.load(a.change_id);
+  const lockCampaign = (cid, fn) => withLock(DATA_DIR, fn, { key: `campaign:${shop.storeId}:${cid}`, what: '这个广告活动的修改', waitMs: 5000, owner: `ebay-seller-mcp ${process.pid}` }).catch((err) => {
+    if (err instanceof LockBusyError) throw new ListingError('这个广告活动正在被另一个任务修改，等它结束后再用同一个 change_id 调 ebay_ad_change_apply，不要重新预检。');
+    throw err;
+  });
+  try {
+    const r = await withUserToken(shop, (token) => applyAdChange({
+      previews, id: a.change_id, storeId: shop.storeId, lockCampaign,
+      load: (cid) => loadCampaign(token, cid),
+      send: (req) => restCall({ token, method: req.method, path: req.path, body: req.body ?? undefined }),
+    }), { needScopes: MARKETING_SCOPES });
+    const campaign = { campaign_id: r.rec.campaign_id, name: r.rec.title };
+    if (!r.ok) {
+      return { shop: shop.name, ok: false, campaign, partial: r.partial === true, failed: r.failed,
+        note: r.partial ? '部分商品没改成功（failed 里是失败的商品和原因），其余已生效：用 ebay_ad_campaign_ads 看现状，失败的按原因调整后重新预检。' : 'eBay 拒绝了这次修改（没有生效）：按 failed 里的原因调整后重新预检。' };
+    }
+    return { shop: shop.name, ok: true, campaign, action: r.rec.action, changes: r.rec.changes, already_applied: r.already_applied === true,
+      note: r.already_applied ? '活动已经是改后的状态了，没有重复执行。' : '已生效。用 ebay_ad_campaigns / ebay_ad_campaign_ads 可以看改后的样子。' };
+  } finally {
+    forgetCampaigns(shop);
+  }
+};
+
 // ---- 修改已有 listing：预检（算出改前 → 改后，存成修改记录）→ 用户确认 → ebay_listing_apply ----
 const fetchItem = async (token, itemId) => parseItemDetail(failIf(await tradingCall({ token, call: 'GetItem', body: `<ItemID>${itemId}</ItemID><DetailLevel>ReturnAll</DetailLevel><IncludeItemSpecifics>true</IncludeItemSpecifics>` }), '读 listing ').xml);
 
@@ -557,7 +756,9 @@ const INSTRUCTIONS = 'eBay 市场调研（通过本机紫鸟店铺浏览器里�
   + '前台：ebay_search（买家看到的搜索结果：排名、价格、运费、发货地、已售件数）。金额美元，eBay 美国站。'
   + '刊登（eBay 开放平台）：先 ebay_listing_defaults（店里的政策和发货地）、ebay_category_suggest（找类目）、ebay_category_aspects（类目必填属性和能用的商品状态），'
   + '再 ebay_listing_preview（eBay 只校验不刊登，返回 preview_id、费用和摘要），把摘要给用户确认后才能 ebay_listing_publish(preview_id, confirm=true) 正式刊登。'
-  + '自家店铺数据（只读）：ebay_orders（订单）、ebay_traffic（流量：曝光、浏览、点击率、转化）、ebay_seller_standards（卖家等级）。'
+  + '自家店铺数据（只读）：ebay_orders（订单）、ebay_traffic（流量：曝光、浏览、点击率、转化）、ebay_seller_standards（卖家等级）；'
+  + '财务：ebay_finance_summary（资金和收支合计）、ebay_transactions（每笔交易和费用）、ebay_payouts（回款）；广告：ebay_ad_campaigns、ebay_ad_campaign_ads、ebay_ad_report（效果报表，异步），'
+  + '改广告用 ebay_ad_change_preview → 用户确认 → ebay_ad_change_apply。'
   + '已有 listing：ebay_listings / ebay_listing_get 查；改内容、改价改库存、增删规格用 ebay_listing_revise_preview，下架用 ebay_listing_end_preview，重新上架用 ebay_listing_relist_preview，'
   + '都只生成「改前 → 改后」的修改记录，用户确认后才能 ebay_listing_apply(change_id, confirm=true) 执行。';
 
@@ -654,6 +855,92 @@ const TOOLS = [
     annotations: LISTING_RO,
     inputSchema: obj({ shop: shopArg }),
     run: sellerStandards,
+  },
+  {
+    name: 'ebay_finance_summary',
+    description: '财务概况（eBay 官方财务接口）：现在的资金（总额、可提现、处理中、冻结），最近 N 天的销售入账、退款、非销售扣费（广告费、店铺订阅等）、运单、纠纷合计，以及这段时间的回款笔数和金额。',
+    annotations: LISTING_RO,
+    inputSchema: obj({ shop: shopArg, days: { type: 'integer', enum: FIN_DAYS, default: 30, description: '最近多少天' } }),
+    run: financeSummary,
+  },
+  {
+    name: 'ebay_transactions',
+    description: '资金交易明细：每笔销售 / 退款 / 扣费 / 运单 / 纠纷的时间、金额、入账或扣款、资金状态、关联订单，销售的各项费用拆分（成交费、国际费、广告费…），非销售扣费的费用类型；可按类型筛选、翻页；附这一页按类型和费用类型的合计。不返回买家信息。',
+    annotations: LISTING_RO,
+    inputSchema: obj({
+      shop: shopArg,
+      days: { type: 'integer', enum: FIN_DAYS, default: 30 },
+      type: { type: 'string', enum: TX_TYPES, description: '只看某类：SALE 销售 / REFUND 退款 / NON_SALE_CHARGE 非销售扣费 / SHIPPING_LABEL 运单 / DISPUTE 纠纷 / TRANSFER / ADJUSTMENT …；不填 = 全部' },
+      page: { type: 'integer', minimum: 1, maximum: 100, default: 1 },
+      page_size: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+    }),
+    run: transactions,
+  },
+  {
+    name: 'ebay_payouts',
+    description: '回款记录：每笔回款的时间、状态（已到账 / 已发起 / 失败）、金额、换汇后金额和汇率、包含的交易数、手续费。不返回银行卡信息。',
+    annotations: LISTING_RO,
+    inputSchema: obj({ shop: shopArg, days: { type: 'integer', enum: FIN_DAYS, default: 90 }, page: { type: 'integer', minimum: 1, maximum: 100, default: 1 }, page_size: { type: 'integer', minimum: 1, maximum: 200, default: 50 } }),
+    run: payouts,
+  },
+  {
+    name: 'ebay_ad_campaigns',
+    description: '推广活动列表：每个活动的 ID、名称、状态（进行中 / 暂停 / 已结束）、付费方式（按成交 / 按点击）、费率策略（固定费率多少 / 动态费率加减多少）、日预算、开始结束时间。',
+    annotations: LISTING_RO,
+    inputSchema: obj({ shop: shopArg, status: { type: 'string', enum: Object.keys(CAMPAIGN_STATUS), default: 'all', description: 'all 全部 / running 进行中 / paused 暂停 / ended 已结束 / scheduled 未开始' } }),
+    run: adCampaigns,
+  },
+  {
+    name: 'ebay_ad_campaign_ads',
+    description: '某个推广活动里的商品：每个商品的 ItemID、标题、广告费率、广告状态。',
+    annotations: LISTING_RO,
+    inputSchema: obj({
+      shop: shopArg, campaign_id: { type: 'string', description: '活动 ID（ebay_ad_campaigns 查）' },
+      page: { type: 'integer', minimum: 1, maximum: 500, default: 1 }, page_size: { type: 'integer', minimum: 1, maximum: 500, default: 200 },
+    }, ['campaign_id']),
+    run: adCampaignAds,
+  },
+  {
+    name: 'ebay_ad_report',
+    description: '推广效果报表（eBay 官方广告报表）：曝光、点击、点击率、广告带来的成交数和成交额、广告费、每单广告费（按点击付费还有 ROAS、转化率、单次点击费）。'
+      + 'report：account 全账户按天 / campaign 按活动按天 / listing 按商品 / transaction 广告带来的每笔成交 / keyword 按关键词、search_query 按买家搜索词（这两个只有按点击付费）。'
+      + 'eBay 生成报表要 1~3 分钟：第一次调用可能返回 status=pending，过一会儿用同样参数再调就能拿到结果。',
+    annotations: LISTING_RO,
+    inputSchema: obj({
+      shop: shopArg,
+      report: { type: 'string', enum: Object.keys(REPORTS), default: 'account' },
+      funding: { type: 'string', enum: ['cps', 'cpc'], default: 'cps', description: 'cps 按成交付费 / cpc 按点击付费' },
+      days: { type: 'integer', enum: AD_DAYS, default: 30, description: '最近多少个整天（到昨天）' },
+      campaign_id: { type: 'string', description: '只看某个活动' },
+      limit: { type: 'integer', minimum: 1, maximum: 1000, default: 200, description: '最多返回多少行' },
+    }),
+    run: adReport,
+  },
+  {
+    name: 'ebay_ad_change_preview',
+    description: '广告修改预检（不会改 eBay 上的东西）：读当前活动，算出「改前 → 改后」，返回 change_id。action：pause 暂停 / resume 恢复 / end 结束活动；'
+      + 'update_ad_rate 改费率策略（strategy=FIXED + bid_percentage，或 DYNAMIC + adjustment / cap）；update_bids 改商品费率、add_listings 加商品、remove_listings 移出商品（listings，按成交付费活动）；update_budget 改日预算（按点击付费）。',
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    inputSchema: obj({
+      shop: shopArg,
+      campaign_id: { type: 'string', description: '活动 ID（ebay_ad_campaigns 查）' },
+      action: { type: 'string', enum: Object.keys(AD_ACTIONS), description: Object.entries(AD_ACTIONS).map(([k, v]) => `${k} ${v}`).join(' / ') },
+      strategy: { type: 'string', enum: ['FIXED', 'DYNAMIC'], description: 'update_ad_rate：FIXED 固定费率 / DYNAMIC 动态费率' },
+      bid_percentage: { type: 'number', description: 'update_ad_rate + FIXED：固定费率（2~100%）' },
+      adjustment: { type: 'number', description: 'update_ad_rate + DYNAMIC：在 eBay 建议费率上加减的百分点（如 2 = 建议费率 +2 个百分点）' },
+      cap: { type: 'number', description: 'update_ad_rate + DYNAMIC：动态费率上限（%）' },
+      listings: { type: 'array', description: 'update_bids / add_listings：[{ "listing_id": "ItemID", "bid_percentage": 6 }]；remove_listings：["ItemID", …]（最多 500 个）' },
+      daily_budget: { type: 'number', description: 'update_budget：新的日预算（美元）' },
+    }, ['campaign_id', 'action']),
+    run: adChangePreview,
+  },
+  {
+    name: 'ebay_ad_change_apply',
+    description: '执行广告修改（会改 eBay 上的广告）：只能执行 ebay_ad_change_preview 生成的修改记录（按 change_id）。必须先把 changes 给用户看、用户明确同意后才能调用，confirm 传 true。'
+      + '执行前会重新读活动，预检后被改过就拒绝；同一个 change_id 不会重复执行。',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+    inputSchema: obj({ shop: shopArg, change_id: { type: 'string', description: 'ebay_ad_change_preview 返回的 change_id' }, confirm: { type: 'boolean', description: '用户已经看过改动并明确同意时传 true' } }, ['change_id', 'confirm']),
+    run: adChangeApply,
   },
   {
     name: 'ebay_listings',
